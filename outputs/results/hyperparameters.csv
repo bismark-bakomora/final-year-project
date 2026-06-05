@@ -1,0 +1,10 @@
+Hyperparameter,GWO-WOA-AOA-CNN
+filters,"[32, 64, 128, 256]"
+kernel_size,9
+pooling_size,4
+neurons,256
+dropout_rate,0.4072303468992021
+learning_rate,0.004881010482173157
+batch_size,16
+optimizer,sgd
+max_epoch,91

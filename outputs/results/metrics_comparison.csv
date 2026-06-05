@@ -1,0 +1,3 @@
+Method,Accuracy,F1_Score,Sensitivity,Precision,NPV,MCC,Kappa
+NO-CNN,88.24,88.89,88.89,88.89,87.5,76.39,76.39
+GWO-WOA-AOA-CNN,86.13,87.36,90.48,84.44,88.35,72.26,72.05
