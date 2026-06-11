@@ -272,9 +272,22 @@ class HybridOptimizer:
             woa_pos, verbose
         )
 
+        # ── Pick best solution across ALL three stages ──
+        # Not just AOA — whichever stage found the best
+        # fitness overall becomes the final answer
+        stage_results = [
+            (gwo_pos, gwo_fitness, 'GWO'),
+            (woa_pos, woa_fitness, 'WOA'),
+            (aoa_pos, aoa_fitness, 'AOA'),
+        ]
+
+        best_pos, best_fitness, best_stage = min(
+            stage_results, key=lambda x: x[1]
+        )
+
         # ── Decode final hyperparameters ──
         self.best_hyperparams = decode_hyperparameters(
-            aoa_pos
+            best_pos
         )
 
         self.end_time = time.time()
@@ -292,12 +305,14 @@ class HybridOptimizer:
                   f"{(1-woa_fitness)*100:.2f}%")
             print(f"  AOA accuracy: "
                   f"{(1-aoa_fitness)*100:.2f}%")
+            print(f"\nBest stage: {best_stage} "
+                  f"({(1-best_fitness)*100:.2f}%)")
             print(f"\nFinal hyperparameters (Table 6):")
             for k, v in self.best_hyperparams.items():
                 print(f"  {k:15s}: {v}")
 
         return (self.best_hyperparams,
-                aoa_fitness,
+                best_fitness,
                 self.convergence_curve)
 
     # ─────────────────────────────────────
