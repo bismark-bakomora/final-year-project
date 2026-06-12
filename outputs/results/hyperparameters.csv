@@ -1,10 +1,10 @@
 Hyperparameter,GWO-WOA-AOA-CNN
-filters,"[32, 64, 128, 256]"
-kernel_size,9
-pooling_size,4
-neurons,256
-dropout_rate,0.4072303468992021
-learning_rate,0.004881010482173157
-batch_size,16
+filters,"[16, 32, 64, 128]"
+kernel_size,7
+pooling_size,2
+neurons,128
+dropout_rate,0.22235302414352964
+learning_rate,0.008150885309384197
+batch_size,100
 optimizer,sgd
-max_epoch,91
+max_epoch,70

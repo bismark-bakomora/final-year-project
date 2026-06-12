@@ -33,10 +33,10 @@ if __name__ == "__main__":
 
     # ── Step 2: Hybrid Optimization (small test) ──
     hybrid = HybridOptimizer(
-        population_size=3,   # full: 20
-        gwo_iterations=2,    # full: 10
-        woa_iterations=2,    # full: 10
-        aoa_iterations=2,    # full: 10
+        population_size=20,   # full: 20
+        gwo_iterations=10,    # full: 10
+        woa_iterations=10,    # full: 10
+        aoa_iterations=10,    # full: 10
         lower_bounds=LOWER_BOUNDS,
         upper_bounds=UPPER_BOUNDS
     )

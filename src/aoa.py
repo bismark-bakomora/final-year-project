@@ -336,8 +336,8 @@ def test_aoa():
     print(f"alpha = 0.1, mu = 0.499")
 
     aoa = AOA(
-        population_size=3,
-        max_iterations=2,
+        population_size=20,
+        max_iterations=10,
         lower_bounds=LOWER_BOUNDS,
         upper_bounds=UPPER_BOUNDS,
         alpha=0.1,
