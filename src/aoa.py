@@ -205,7 +205,8 @@ class AOA:
     # MAIN OPTIMIZATION LOOP
     # Follows Figure 5 flowchart exactly
     # ─────────────────────────────────────
-    def optimize(self, woa_best_pos, verbose=True):
+    def optimize(self, woa_best_pos, woa_best_fitness=None,
+             verbose=True):
         """
         Run AOA optimization.
         Follows Figure 5 flowchart from paper.
@@ -235,8 +236,13 @@ class AOA:
         )
 
         # ── Set best to WOA result initially ──
-        self.best_pos   = woa_best_pos.copy()
-        self.best_score = fitness_function(woa_best_pos)
+        # Use WOA fitness directly to avoid re-evaluation
+        # variance from CNN random weight initialisation
+        self.best_pos = woa_best_pos.copy()
+        if woa_best_fitness is not None:
+            self.best_score = woa_best_fitness
+        else:
+            self.best_score = fitness_function(woa_best_pos)
 
         # ── Calculate fitness for initial population ──
         # and determine best solution

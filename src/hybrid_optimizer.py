@@ -1,3 +1,5 @@
+from tabnanny import verbose
+
 import numpy as np
 import time
 from src.gwo import GWO
@@ -146,6 +148,7 @@ class HybridOptimizer:
 
         best_pos, best_fitness, curve = woa.optimize(
             gwo_best_pos=gwo_best_pos,
+            gwo_best_fitness=self.gwo_best_fitness,
             verbose=verbose
         )
 
@@ -194,6 +197,7 @@ class HybridOptimizer:
 
         best_pos, best_fitness, curve = aoa.optimize(
             woa_best_pos=woa_best_pos,
+            woa_best_fitness=self.woa_best_fitness,
             verbose=verbose
         )
 
@@ -320,13 +324,15 @@ class HybridOptimizer:
     # Uses full train+val data for final model
     # ─────────────────────────────────────
     def train_final_model(self,
-                          X_train, y_train,
-                          X_val, y_val,
-                          verbose=True):
+                      X_train, y_train,
+                      X_val, y_val,
+                      verbose=True,
+                      n_attempts=5):
         """
         Train final CNN with optimal hyperparameters.
-        Uses training + validation data combined
-        for the final model as per paper.
+        Runs multiple attempts and picks the best
+        to handle random weight initialisation variance
+        and SGD instability (paper uses Adam as default).
         """
         if self.best_hyperparams is None:
             raise RuntimeError(
@@ -336,24 +342,125 @@ class HybridOptimizer:
         if verbose:
             print("\nTraining final CNN model...")
             print(f"Hyperparameters: {self.best_hyperparams}")
+            print(f"Running {n_attempts} attempts "
+                f"to handle initialisation variance...")
 
-        model = build_cnn(self.best_hyperparams)
+        best_model    = None
+        best_val_acc  = 0.0
 
-        train_cnn(
-            model=model,
-            X_train=X_train,
-            y_train=y_train,
-            X_val=X_val,
-            y_val=y_val,
-            batch_size=self.best_hyperparams['batch_size'],
-            max_epoch=self.best_hyperparams['max_epoch'],
-            save_path='models/final_model.weights.h5'
-        )
+        for attempt in range(1, n_attempts + 1):
+            if verbose:
+                print(f"\n  Attempt {attempt}/{n_attempts}...")
+
+            try:
+                model = build_cnn(self.best_hyperparams)
+
+                train_cnn(
+                    model=model,
+                    X_train=X_train,
+                    y_train=y_train,
+                    X_val=X_val,
+                    y_val=y_val,
+                    batch_size=self.best_hyperparams[
+                        'batch_size'],
+                    max_epoch=self.best_hyperparams[
+                        'max_epoch'],
+                )
+
+                # Evaluate on validation set
+                _, val_acc = model.evaluate(
+                    X_val, y_val, verbose=0
+                )
+
+                # Check model predicts both classes
+                # A collapsed model predicts only one class
+                y_prob = model.predict(X_val, verbose=0)
+                y_pred = np.argmax(y_prob, axis=1)
+                unique_classes = len(np.unique(y_pred))
+
+                if verbose:
+                    print(f"  Val accuracy:          "
+                        f"{val_acc*100:.2f}%")
+                    print(f"  Classes predicted:     "
+                        f"{unique_classes}/2")
+
+                # Only accept if predicting both classes
+                if unique_classes >= 2 and \
+                        val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_model   = model
+                    if verbose:
+                        print(f"  ✓ New best model.")
+                else:
+                    if verbose:
+                        print(f"  ✗ Model collapsed "
+                            f"or worse — skipping.")
+
+            except Exception as e:
+                if verbose:
+                    print(f"  Attempt {attempt} failed: {e}")
+
+        # If all attempts collapsed fall back to Adam
+        # SGD can be unstable with certain learning rates
+        if best_model is None:
+            if verbose:
+                print(f"\n  All {n_attempts} attempts "
+                    f"collapsed.")
+                print(f"  Falling back to Adam optimizer "
+                    f"for stability...")
+
+            fallback_hp = self.best_hyperparams.copy()
+            fallback_hp['optimizer']     = 'adam'
+            fallback_hp['learning_rate'] = 0.001
+
+            for attempt in range(1, 4):
+                if verbose:
+                    print(f"\n  Fallback attempt "
+                        f"{attempt}/3...")
+                try:
+                    model = build_cnn(fallback_hp)
+                    train_cnn(
+                        model=model,
+                        X_train=X_train,
+                        y_train=y_train,
+                        X_val=X_val,
+                        y_val=y_val,
+                        batch_size=fallback_hp['batch_size'],
+                        max_epoch=fallback_hp['max_epoch'],
+                    )
+                    _, val_acc = model.evaluate(
+                        X_val, y_val, verbose=0
+                    )
+                    y_pred = np.argmax(
+                        model.predict(X_val, verbose=0),
+                        axis=1
+                    )
+                    unique_classes = len(np.unique(y_pred))
+
+                    if verbose:
+                        print(f"  Val accuracy:      "
+                            f"{val_acc*100:.2f}%")
+                        print(f"  Classes predicted: "
+                            f"{unique_classes}/2")
+
+                    if unique_classes >= 2 and \
+                            val_acc > best_val_acc:
+                        best_val_acc = val_acc
+                        best_model   = model
+                        if verbose:
+                            print(f"  ✓ Fallback model accepted.")
+
+                except Exception as e:
+                    if verbose:
+                        print(f"  Fallback attempt "
+                            f"{attempt} failed: {e}")
 
         if verbose:
-            print("Final model training complete.")
+            print(f"\nFinal model training complete.")
+            print(f"Best validation accuracy: "
+                f"{best_val_acc*100:.2f}%")
 
-        return model
+        return best_model
 
 
 # ─────────────────────────────────────────

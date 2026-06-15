@@ -83,6 +83,13 @@ class GWO:
     # ─────────────────────────────────────
     # STEP 2 — Update leadership hierarchy
     # Alpha = best, Beta = 2nd, Delta = 3rd
+    #
+    # Robust version: combines current population
+    # with previous alpha/beta/delta leaders, then
+    # sorts everything together and picks top 3.
+    # This prevents the bug where a new best solution
+    # overwrites alpha without preserving the previous
+    # alpha as beta (which left delta_pos = None).
     # ─────────────────────────────────────
     def _update_leadership(self, population, fitness_values):
         """
@@ -90,23 +97,32 @@ class GWO:
         alpha, beta, delta positions.
         Paper: solutions ranked by performance.
         """
+        candidates = []
+
+        # Include previous leaders if they exist
+        if self.alpha_pos is not None:
+            candidates.append((self.alpha_score,
+                              self.alpha_pos))
+        if self.beta_pos is not None:
+            candidates.append((self.beta_score,
+                              self.beta_pos))
+        if self.delta_pos is not None:
+            candidates.append((self.delta_score,
+                              self.delta_pos))
+
+        # Add current population
         for i in range(self.population_size):
-            fitness = fitness_values[i]
+            candidates.append(
+                (fitness_values[i], population[i].copy())
+            )
 
-            # Update alpha — best solution
-            if fitness < self.alpha_score:
-                self.alpha_score = fitness
-                self.alpha_pos   = population[i].copy()
+        # Sort ascending — lower fitness is better
+        candidates.sort(key=lambda x: x[0])
 
-            # Update beta — second best
-            elif fitness < self.beta_score:
-                self.beta_score = fitness
-                self.beta_pos   = population[i].copy()
-
-            # Update delta — third best
-            elif fitness < self.delta_score:
-                self.delta_score = fitness
-                self.delta_pos   = population[i].copy()
+        # Top 3 become alpha, beta, delta
+        self.alpha_score, self.alpha_pos = candidates[0]
+        self.beta_score,  self.beta_pos  = candidates[1]
+        self.delta_score, self.delta_pos = candidates[2]
 
     # ─────────────────────────────────────
     # STEP 3 — Calculate A and C vectors

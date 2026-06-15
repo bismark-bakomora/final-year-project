@@ -181,7 +181,8 @@ class WOA:
     # MAIN OPTIMIZATION LOOP
     # Follows Figure 4 flowchart exactly
     # ─────────────────────────────────────
-    def optimize(self, gwo_best_pos, verbose=True):
+    def optimize(self, gwo_best_pos, gwo_best_fitness=None,
+             verbose=True):
         """
         Run WOA optimization.
         Follows Figure 4 flowchart from paper.
@@ -211,8 +212,13 @@ class WOA:
         )
 
         # ── Set best to GWO result initially ──
-        self.best_pos   = gwo_best_pos.copy()
-        self.best_score = fitness_function(gwo_best_pos)
+        # Use GWO fitness directly to avoid re-evaluation
+        # variance from CNN random weight initialisation
+        self.best_pos = gwo_best_pos.copy()
+        if gwo_best_fitness is not None:
+            self.best_score = gwo_best_fitness
+        else:
+            self.best_score = fitness_function(gwo_best_pos)
 
         # ── Evaluate initial population ──
         for i in range(self.population_size):
