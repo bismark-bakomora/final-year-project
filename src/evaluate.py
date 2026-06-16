@@ -189,7 +189,7 @@ def plot_all_confusion_matrices(results_dict):
     save_path = 'outputs/figures/confusion_matrices.png'
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Confusion matrices saved → {save_path}")
+    print(f"Confusion matrices saved -> {save_path}")
 
 
 # ─────────────────────────────────────────
@@ -250,7 +250,7 @@ def plot_roc_curves(roc_data_dict):
     save_path = 'outputs/figures/roc_curves.png'
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"ROC curves saved → {save_path}")
+    print(f"ROC curves saved -> {save_path}")
 
 
 # ─────────────────────────────────────────
@@ -304,7 +304,7 @@ def plot_convergence_curves(curves_dict):
     save_path = 'outputs/figures/convergence_curves.png'
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Convergence curves saved → {save_path}")
+    print(f"Convergence curves saved -> {save_path}")
 
 
 # ─────────────────────────────────────────
@@ -353,7 +353,7 @@ def print_results_table(results_dict):
             ])
 
     print("=" * 85)
-    print(f"\nResults saved → {csv_path}")
+    print(f"\nResults saved -> {csv_path}")
 
 
 # ─────────────────────────────────────────
@@ -458,7 +458,7 @@ def statistical_significance_test(
 
     print("=" * 70)
     print("* p<0.05 = statistically significant")
-    print(f"\nStatistical analysis saved → {csv_path}")
+    print(f"\nStatistical analysis saved -> {csv_path}")
 
 
 # ─────────────────────────────────────────
@@ -494,7 +494,7 @@ def save_hyperparameter_results(hp_dict):
                 row.append(hp.get(key, 'N/A'))
             writer.writerow(row)
 
-    print(f"Hyperparameters saved → {csv_path}")
+    print(f"Hyperparameters saved -> {csv_path}")
 
 
 # ─────────────────────────────────────────
@@ -550,7 +550,7 @@ def plot_performance_comparison(results_dict):
     plt.savefig(save_path, dpi=150,
                 bbox_inches='tight')
     plt.close()
-    print(f"Performance chart saved → {save_path}")
+    print(f"Performance chart saved -> {save_path}")
 
 
 # ─────────────────────────────────────────

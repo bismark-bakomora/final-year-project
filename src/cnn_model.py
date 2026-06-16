@@ -304,6 +304,125 @@ def test_cnn_build():
 
     return model
 
+# ─────────────────────────────────────────
+# TRAIN MODEL WITH RETRIES
+# Shared by hybrid and standalone algorithms
+# Handles SGD instability and random weight
+# initialisation variance
+# ─────────────────────────────────────────
+def train_model_with_retries(hyperparams,
+                              X_train, y_train,
+                              X_val, y_val,
+                              n_attempts=5,
+                              verbose=True,
+                              label=""):
+    """
+    Train a CNN with given hyperparameters,
+    retrying multiple times and keeping the
+    best non-collapsed model.
+
+    A "collapsed" model predicts only one class
+    (common with unstable SGD + high LR).
+
+    Parameters
+    ----------
+    hyperparams : dict
+        Decoded hyperparameters.
+    label : str
+        Name for logging (e.g. "GWO-CNN").
+
+    Returns
+    -------
+    best_model : keras Model
+    """
+    import numpy as np
+
+    if verbose:
+        print(f"\nTraining {label}...")
+        print(f"Hyperparameters: {hyperparams}")
+        print(f"Running {n_attempts} attempts...")
+
+    best_model   = None
+    best_val_acc = 0.0
+
+    for attempt in range(1, n_attempts + 1):
+        if verbose:
+            print(f"\n  Attempt {attempt}/{n_attempts}...")
+
+        try:
+            model = build_cnn(hyperparams)
+            train_cnn(
+                model=model,
+                X_train=X_train, y_train=y_train,
+                X_val=X_val, y_val=y_val,
+                batch_size=hyperparams['batch_size'],
+                max_epoch=hyperparams['max_epoch'],
+            )
+
+            _, val_acc = model.evaluate(
+                X_val, y_val, verbose=0
+            )
+
+            y_pred = np.argmax(
+                model.predict(X_val, verbose=0), axis=1
+            )
+            unique_classes = len(np.unique(y_pred))
+
+            if verbose:
+                print(f"  Val accuracy:      "
+                      f"{val_acc*100:.2f}%")
+                print(f"  Classes predicted: "
+                      f"{unique_classes}/2")
+
+            if unique_classes >= 2 and val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model   = model
+                if verbose:
+                    print(f"  >> New best model.")
+
+        except Exception as e:
+            if verbose:
+                print(f"  Attempt {attempt} failed: {e}")
+
+    # Fallback to Adam if everything collapsed
+    if best_model is None:
+        if verbose:
+            print(f"\n  All attempts collapsed. "
+                  f"Falling back to Adam...")
+
+        fallback_hp = hyperparams.copy()
+        fallback_hp['optimizer']     = 'adam'
+        fallback_hp['learning_rate'] = 0.001
+
+        for attempt in range(1, 4):
+            try:
+                model = build_cnn(fallback_hp)
+                train_cnn(
+                    model=model,
+                    X_train=X_train, y_train=y_train,
+                    X_val=X_val, y_val=y_val,
+                    batch_size=fallback_hp['batch_size'],
+                    max_epoch=fallback_hp['max_epoch'],
+                )
+                _, val_acc = model.evaluate(
+                    X_val, y_val, verbose=0
+                )
+                y_pred = np.argmax(
+                    model.predict(X_val, verbose=0), axis=1
+                )
+                if len(np.unique(y_pred)) >= 2 and \
+                        val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_model   = model
+            except Exception:
+                pass
+
+    if verbose:
+        print(f"\n{label} training complete.")
+        print(f"Best validation accuracy: "
+              f"{best_val_acc*100:.2f}%")
+
+    return best_model
 
 if __name__ == "__main__":
     test_cnn_build()

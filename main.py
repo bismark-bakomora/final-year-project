@@ -1,18 +1,44 @@
+import sys
+import io
+sys.stdout = io.TextIOWrapper(
+    sys.stdout.buffer, encoding='utf-8', errors='replace'
+)
+sys.stderr = io.TextIOWrapper(
+    sys.stderr.buffer, encoding='utf-8', errors='replace'
+)
 import numpy as np
 from src.preprocess import run_preprocessing
 from src.hybrid_optimizer import HybridOptimizer
 from src.cnn_model import (
     LOWER_BOUNDS, UPPER_BOUNDS,
-    build_cnn, train_cnn, decode_hyperparameters
+    build_cnn, train_cnn, decode_hyperparameters,
+    train_model_with_retries
 )
-from src.fitness import set_data
+from src.standalone_optimizers import (
+    run_standalone_gwo, run_standalone_woa,
+    run_standalone_aoa, run_standalone_rime
+)
+from src.fitness import set_data, reset_history
 from src.evaluate import run_full_evaluation
+
+# ─────────────────────────────────────────
+# CONFIGURATION
+# Adjust these for quick test vs full run
+# ─────────────────────────────────────────
+POPULATION_SIZE = 10  # full paper: 20
+ITERATIONS      = 5  # full paper: 10 (per algorithm)
+RUN_LABEL       = "Half run — medium population"
+# For full run set:
+# POPULATION_SIZE = 20
+# ITERATIONS      = 10
+# RUN_LABEL       = "FULL RUN — paper parameters"
+
 
 if __name__ == "__main__":
 
     print("=" * 50)
     print("GWO-WOA-AOA Heart Disease Prediction")
-    print("QUICK TEST — small population")
+    print(RUN_LABEL)
     print("=" * 50)
 
     # ── Step 1: Preprocessing ──
@@ -27,59 +53,148 @@ if __name__ == "__main__":
     y_val   = np.load('data/processed/y_val.npy')
     X_test  = np.load('data/processed/X_test.npy')
     y_test  = np.load('data/processed/y_test.npy')
-    y_test_raw  = np.load(
-        'data/processed/y_test_raw.npy'
-    )
+    y_test_raw = np.load('data/processed/y_test_raw.npy')
 
-    # ── Step 2: Hybrid Optimization (small test) ──
-    hybrid = HybridOptimizer(
-        population_size=3,   # full: 20
-        gwo_iterations=2,    # full: 10
-        woa_iterations=2,    # full: 10
-        aoa_iterations=2,    # full: 10
-        lower_bounds=LOWER_BOUNDS,
-        upper_bounds=UPPER_BOUNDS
-    )
+    set_data(X_train, y_train, X_val, y_val)
 
-    best_hp, best_fitness, conv_curve = hybrid.optimize(
-        X_train, y_train, X_val, y_val, verbose=True
-    )
+    models_dict        = {}
+    convergence_curves = {}
+    hp_dict            = {}
 
-    # ── Step 3: Train final model ──
-    final_model = hybrid.train_final_model(
-        X_train, y_train, X_val, y_val, verbose=True
-    )
-
-    # ── Step 4: Build NO-CNN baseline ──
-    print("\nTraining NO-CNN baseline...")
+    # =================================================
+    # MODEL 1 — NO-CNN (baseline, no optimization)
+    # =================================================
+    print("\n" + "=" * 50)
+    print("MODEL 1/6 — NO-CNN (baseline)")
+    print("=" * 50)
     no_cnn_hp = decode_hyperparameters(
         [1, 1, 1, 2, 0.3, 0.001, 2, 0, 50]
     )
-    no_cnn = build_cnn(no_cnn_hp)
-    train_cnn(
-        no_cnn, X_train, y_train,
-        X_val, y_val,
-        no_cnn_hp['batch_size'],
-        no_cnn_hp['max_epoch']
+    no_cnn = train_model_with_retries(
+        no_cnn_hp, X_train, y_train, X_val, y_val,
+        n_attempts=3, label="NO-CNN"
     )
-    print("NO-CNN training complete.")
+    models_dict['NO-CNN'] = no_cnn
 
-    # ── Step 5: Evaluate both models ──
-    models_dict = {
-        'NO-CNN':          no_cnn,
-        'GWO-WOA-AOA-CNN': final_model,
-    }
+    # =================================================
+    # MODEL 2 — GWO-CNN (standalone GWO)
+    # =================================================
+    print("\n" + "=" * 50)
+    print("MODEL 2/6 — GWO-CNN (standalone)")
+    print("=" * 50)
+    reset_history()
+    gwo_pos, gwo_fit, gwo_curve = run_standalone_gwo(
+        POPULATION_SIZE, ITERATIONS,
+        LOWER_BOUNDS, UPPER_BOUNDS, verbose=True
+    )
+    gwo_hp = decode_hyperparameters(gwo_pos)
+    gwo_model = train_model_with_retries(
+        gwo_hp, X_train, y_train, X_val, y_val,
+        n_attempts=3, label="GWO-CNN"
+    )
+    models_dict['GWO-CNN'] = gwo_model
+    convergence_curves['GWO'] = gwo_curve
+    hp_dict['GWO-CNN'] = gwo_hp
 
-    convergence_curves = {
-        'GWO-WOA-AOA': conv_curve,
-    }
+    # =================================================
+    # MODEL 3 — WOA-CNN (standalone WOA)
+    # =================================================
+    print("\n" + "=" * 50)
+    print("MODEL 3/6 — WOA-CNN (standalone)")
+    print("=" * 50)
+    reset_history()
+    woa_pos, woa_fit, woa_curve = run_standalone_woa(
+        POPULATION_SIZE, ITERATIONS,
+        LOWER_BOUNDS, UPPER_BOUNDS, verbose=True
+    )
+    woa_hp = decode_hyperparameters(woa_pos)
+    woa_model = train_model_with_retries(
+        woa_hp, X_train, y_train, X_val, y_val,
+        n_attempts=3, label="WOA-CNN"
+    )
+    models_dict['WOA-CNN'] = woa_model
+    convergence_curves['WOA'] = woa_curve
+    hp_dict['WOA-CNN'] = woa_hp
 
-    hp_dict = {
-        'GWO-WOA-AOA-CNN': best_hp,
+    # =================================================
+    # MODEL 4 — AOA-CNN (standalone AOA)
+    # =================================================
+    print("\n" + "=" * 50)
+    print("MODEL 4/6 — AOA-CNN (standalone)")
+    print("=" * 50)
+    reset_history()
+    aoa_pos, aoa_fit, aoa_curve = run_standalone_aoa(
+        POPULATION_SIZE, ITERATIONS,
+        LOWER_BOUNDS, UPPER_BOUNDS, verbose=True
+    )
+    aoa_hp = decode_hyperparameters(aoa_pos)
+    aoa_model = train_model_with_retries(
+        aoa_hp, X_train, y_train, X_val, y_val,
+        n_attempts=3, label="AOA-CNN"
+    )
+    models_dict['AOA-CNN'] = aoa_model
+    convergence_curves['AOA'] = aoa_curve
+    hp_dict['AOA-CNN'] = aoa_hp
+
+    # =================================================
+    # MODEL 5 — RIME-CNN (standalone RIME)
+    # =================================================
+    print("\n" + "=" * 50)
+    print("MODEL 5/6 — RIME-CNN (standalone)")
+    print("=" * 50)
+    reset_history()
+    rime_pos, rime_fit, rime_curve = run_standalone_rime(
+        POPULATION_SIZE, ITERATIONS,
+        LOWER_BOUNDS, UPPER_BOUNDS, verbose=True
+    )
+    rime_hp = decode_hyperparameters(rime_pos)
+    rime_model = train_model_with_retries(
+        rime_hp, X_train, y_train, X_val, y_val,
+        n_attempts=3, label="RIME-CNN"
+    )
+    models_dict['RIME-CNN'] = rime_model
+    convergence_curves['RIME'] = rime_curve
+    hp_dict['RIME-CNN'] = rime_hp
+
+    # =================================================
+    # MODEL 6 — GWO-WOA-AOA-CNN (the hybrid)
+    # =================================================
+    print("\n" + "=" * 50)
+    print("MODEL 6/6 — GWO-WOA-AOA-CNN (hybrid)")
+    print("=" * 50)
+    hybrid = HybridOptimizer(
+        population_size=POPULATION_SIZE,
+        gwo_iterations=ITERATIONS,
+        woa_iterations=ITERATIONS,
+        aoa_iterations=ITERATIONS,
+        lower_bounds=LOWER_BOUNDS,
+        upper_bounds=UPPER_BOUNDS
+    )
+    best_hp, best_fitness, hybrid_curve = hybrid.optimize(
+        X_train, y_train, X_val, y_val, verbose=True
+    )
+    final_model = hybrid.train_final_model(
+        X_train, y_train, X_val, y_val, verbose=True
+    )
+    models_dict['GWO-WOA-AOA-CNN'] = final_model
+    convergence_curves['GWO-WOA-AOA'] = hybrid_curve
+    hp_dict['GWO-WOA-AOA-CNN'] = best_hp
+
+    # =================================================
+    # EVALUATION — Table 7, Figures 8, 9, 10
+    # =================================================
+    # Reorder to match paper Table 7 order
+    ordered_models = {
+        'NO-CNN':          models_dict['NO-CNN'],
+        'RIME-CNN':        models_dict['RIME-CNN'],
+        'AOA-CNN':         models_dict['AOA-CNN'],
+        'WOA-CNN':         models_dict['WOA-CNN'],
+        'GWO-CNN':         models_dict['GWO-CNN'],
+        'GWO-WOA-AOA-CNN': models_dict['GWO-WOA-AOA-CNN'],
     }
 
     results = run_full_evaluation(
-        models_dict=models_dict,
+        models_dict=ordered_models,
         X_test=X_test,
         y_test_cat=y_test,
         y_test_raw=y_test_raw,
@@ -87,11 +202,5 @@ if __name__ == "__main__":
         hp_dict=hp_dict
     )
 
-    print("\nQuick test complete.")
-    print("Check outputs/ folder:")
-    print("  outputs/figures/confusion_matrices.png")
-    print("  outputs/figures/roc_curves.png")
-    print("  outputs/figures/convergence_curves.png")
-    print("  outputs/figures/performance_comparison.png")
-    print("  outputs/results/metrics_comparison.csv")
-    print("  outputs/results/hyperparameters.csv")
+    print("\nFull comparison complete.")
+    print("Check outputs/ folder for all figures and results.")
