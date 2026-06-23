@@ -93,12 +93,19 @@ def compute_shap_values(model, X_train, X_test,
     raw_shap = explainer.shap_values(X_explain)
 
     # We focus on class 1 (heart disease present)
-    # Squeeze from (N, 11, 1, 1) to (N, 11)
+    # Squeeze from (N, 11, 1, 1) or (N, 11, 1, 1, 2) to (N, 11)
     if isinstance(raw_shap, list):
-        # Multi-output: take class 1 (disease)
-        shap_values = raw_shap[1].squeeze(axis=(2, 3))
+        # Multi-output list: take class 1 (disease)
+        shap_values = raw_shap[1].squeeze()
+        if shap_values.ndim > 2:
+            shap_values = shap_values.reshape(shap_values.shape[0], -1)
     else:
-        shap_values = raw_shap.squeeze(axis=(2, 3))
+        arr = np.array(raw_shap).squeeze()
+        # If shape is (N, features, classes), take class 1
+        if arr.ndim == 3:
+            shap_values = arr[..., 1]
+        else:
+            shap_values = arr
 
     # Squeeze X_explain from (N, 11, 1, 1) to (N, 11)
     X_explain_2d = X_explain.squeeze(axis=(2, 3))
@@ -124,8 +131,8 @@ def plot_shap_importance(shap_values,
     Features sorted by mean |SHAP value|,
     highest at top (horizontal bar chart).
     """
-    # Mean absolute SHAP value per feature
-    mean_abs_shap = np.abs(shap_values).mean(axis=0)
+    # Mean absolute SHAP value per feature (collapse samples and classes)
+    mean_abs_shap = np.abs(shap_values).mean(axis=(0, -1)) if shap_values.ndim == 3 else np.abs(shap_values).mean(axis=0)
 
     # Sort ascending so highest appears at top
     # when plotted as horizontal bar chart

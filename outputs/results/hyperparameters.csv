@@ -1,10 +1,10 @@
-Hyperparameter,GWO-WOA-AOA-CNN
-filters,"[8, 16, 32, 64]"
-kernel_size,11
-pooling_size,2
-neurons,128
-dropout_rate,0.49967862325772955
-learning_rate,0.0015599149428700966
-batch_size,32
-optimizer,sgd
-max_epoch,86
+Hyperparameter,GWO-CNN,WOA-CNN,AOA-CNN,RIME-CNN,GWO-WOA-AOA-CNN
+filters,"[32, 64, 128, 256]","[8, 16, 32, 64]","[16, 32, 64, 128]","[64, 128, 256, 512]","[32, 64, 128, 256]"
+kernel_size,11,9,3,7,5
+pooling_size,2,2,3,2,2
+neurons,16,128,16,64,64
+dropout_rate,0.16546566569254856,0.37274921814546147,0.3480926364686372,0.1,0.48937650511483444
+learning_rate,0.00648654552721627,0.004229127917530437,0.009680494883648996,0.006370570393693601,0.006466816318043885
+batch_size,8,32,100,32,8
+optimizer,rmsprop,rmsprop,adam,rmsprop,adam
+max_epoch,61,43,48,67,95
