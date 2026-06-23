@@ -20,18 +20,18 @@ from src.standalone_optimizers import (
 )
 from src.fitness import set_data, reset_history
 from src.evaluate import run_full_evaluation
+from src.shap_analysis import run_shap_analysis
+from src.smote_analysis import run_smote_analysis
+import joblib
 
 # ─────────────────────────────────────────
 # CONFIGURATION
 # Adjust these for quick test vs full run
 # ─────────────────────────────────────────
-POPULATION_SIZE = 10  # full paper: 20
-ITERATIONS      = 5  # full paper: 10 (per algorithm)
-RUN_LABEL       = "Half run — medium population"
-# For full run set:
-# POPULATION_SIZE = 20
-# ITERATIONS      = 10
-# RUN_LABEL       = "FULL RUN — paper parameters"
+POPULATION_SIZE = 3  # full paper: 20
+ITERATIONS      = 2  # full paper: 10 (per algorithm)
+RUN_LABEL       = "quick run — medium population"
+
 
 
 if __name__ == "__main__":
@@ -200,6 +200,54 @@ if __name__ == "__main__":
         y_test_raw=y_test_raw,
         convergence_curves=convergence_curves,
         hp_dict=hp_dict
+    )
+
+    # =================================================
+    # SHAP EXPLAINABILITY ANALYSIS
+    # Paper Section 4.4 — Figures 14 and 15
+    # =================================================
+    print("\n" + "=" * 50)
+    print("SHAP ANALYSIS")
+    print("=" * 50)
+
+    if final_model is not None:
+        shap_values, mean_shap = run_shap_analysis(
+            model=final_model,
+            X_train=X_train,
+            X_test=X_test,
+            n_background=100,  # increase for accuracy
+            n_explain=200       # explain all test samples
+        )
+    else:
+        print("No final model available for SHAP analysis.")
+
+    # =================================================
+    # SMOTE AUGMENTATION ANALYSIS
+    # Paper Section 4.5 — Table 10 and Figure 16
+    # =================================================
+    print("\n" + "=" * 50)
+    print("SMOTE AUGMENTATION ANALYSIS")
+    print("=" * 50)
+
+    # Load scaler fitted during preprocessing
+    scaler = joblib.load('models/scaler.pkl')
+
+    # Load raw integer labels for SMOTE
+    y_train_raw = np.load('data/processed/y_train_raw.npy')
+    y_val_raw   = np.load('data/processed/y_val_raw.npy')
+    y_test_raw  = np.load('data/processed/y_test_raw.npy')
+
+    smote_results = run_smote_analysis(
+        best_hyperparams=best_hp,
+        X_train_raw=X_train,
+        y_train_raw=y_train_raw,
+        X_val_raw=X_val,
+        y_val_raw=y_val_raw,
+        X_test_raw=X_test,
+        y_test_raw=y_test_raw,
+        scaler=scaler,
+        framingham_path=None,  
+        n_attempts=5
     )
 
     print("\nFull comparison complete.")
