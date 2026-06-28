@@ -31,7 +31,7 @@ OPTIMIZER_OPTIONS = ['adam', 'sgd', 'rmsprop'] # index 0-2
 # Continuous ranges
 DROPOUT_MIN  = 0.1;  DROPOUT_MAX  = 0.5
 LR_MIN       = 0.0001; LR_MAX     = 0.01
-EPOCH_MIN    = 10;   EPOCH_MAX    = 100
+EPOCH_MIN    = 10;   EPOCH_MAX    = 50
 
 # Hyperparameter vector indices
 # x = [filters_idx, kernel_idx, pooling_idx, neurons_idx,

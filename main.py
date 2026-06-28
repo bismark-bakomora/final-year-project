@@ -28,8 +28,8 @@ import joblib
 # CONFIGURATION
 # Adjust these for quick test vs full run
 # ─────────────────────────────────────────
-POPULATION_SIZE = 3  # full paper: 20
-ITERATIONS      = 2  # full paper: 10 (per algorithm)
+POPULATION_SIZE = 6  # full paper: 20
+ITERATIONS      = 3  # full paper: 10 (per algorithm)
 RUN_LABEL       = "quick run — medium population"
 
 
