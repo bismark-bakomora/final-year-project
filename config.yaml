@@ -1,0 +1,42 @@
+# Pipeline configuration — matches paper Section 4.2 defaults
+# Use preset "quick" for smoke tests (~5 min)
+
+paper:
+  population_size: 20
+  hybrid_iterations_per_stage: 10   # GWO + WOA + AOA = 30 total (Section 3.2.4)
+  standalone_iterations: 30         # Section 4.2 standalone comparison
+  train_attempts_final: 3
+  train_attempts_standalone: 1
+  early_stopping_patience: 5
+
+quick:
+  population_size: 3
+  hybrid_iterations_per_stage: 2
+  standalone_iterations: 2
+  train_attempts_final: 1
+  train_attempts_standalone: 1
+  early_stopping_patience: 3
+
+paths:
+  raw_data: data/raw/heart_statlog_cleveland_hungary_final.csv
+  processed_dir: data/processed
+  models_dir: models
+  outputs_dir: outputs
+  runs_dir: outputs/runs
+  logs_dir: outputs/logs
+
+shap:
+  n_background: 50
+  n_explain: 100
+
+smote:
+  n_attempts: 3
+
+logging:
+  level: INFO
+  max_bytes: 10485760   # 10 MB per log file
+  backup_count: 5
+
+memory:
+  fitness_eval_log_interval: 25     # log progress every N fitness evaluations
+  gc_after_fitness: true

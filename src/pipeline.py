@@ -1,0 +1,525 @@
+"""
+Paper-aligned pipeline runner.
+
+Each command runs one logical experiment at a time, saves artifacts to disk,
+and frees memory before the next stage — matching how the paper timed
+individual optimizer runs (Section 4.2).
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+import joblib
+import numpy as np
+
+from src.artifacts import (
+    finalize_run,
+    init_run,
+    load_keras_model,
+    list_saved_models,
+    model_artifact_exists,
+    new_run_id,
+    record_stage,
+    register_artifact,
+    resolve_run_dir,
+    save_convergence,
+    save_hyperparameters,
+    save_keras_model,
+)
+from src.cnn_model import (
+    LOWER_BOUNDS,
+    UPPER_BOUNDS,
+    decode_hyperparameters,
+    train_model_with_retries,
+)
+from src.config import RunSettings, load_settings
+from src.evaluate import run_full_evaluation
+from src.fitness import configure_fitness_logging, reset_history, set_data
+from src.hybrid_optimizer import HybridOptimizer
+from src.logging_config import get_stage_logger, setup_logging
+from src.memory_utils import cleanup_after_stage, release_model
+from src.preprocess import run_preprocessing
+from src.shap_analysis import run_shap_analysis
+from src.smote_analysis import run_smote_analysis
+from src.standalone_optimizers import (
+    run_standalone_aoa,
+    run_standalone_gwo,
+    run_standalone_rime,
+    run_standalone_woa,
+)
+from src.tf_config import configure_tensorflow_runtime
+
+STANDALONE_ALGOS = {
+    "gwo": ("GWO-CNN", run_standalone_gwo, "GWO"),
+    "woa": ("WOA-CNN", run_standalone_woa, "WOA"),
+    "aoa": ("AOA-CNN", run_standalone_aoa, "AOA"),
+    "rime": ("RIME-CNN", run_standalone_rime, "RIME"),
+}
+
+COMPARE_STAGES: list[tuple[str, str, str | None]] = [
+    ("NO-CNN", "baseline", None),
+    ("RIME-CNN", "standalone", "rime"),
+    ("AOA-CNN", "standalone", "aoa"),
+    ("WOA-CNN", "standalone", "woa"),
+    ("GWO-CNN", "standalone", "gwo"),
+    ("GWO-WOA-AOA-CNN", "hybrid", None),
+]
+
+TABLE7_ORDER = [
+    "NO-CNN",
+    "RIME-CNN",
+    "AOA-CNN",
+    "WOA-CNN",
+    "GWO-CNN",
+    "GWO-WOA-AOA-CNN",
+]
+
+
+@dataclass
+class DatasetBundle:
+    X_train: np.ndarray
+    y_train: np.ndarray
+    X_val: np.ndarray
+    y_val: np.ndarray
+    X_test: np.ndarray
+    y_test: np.ndarray
+    y_test_raw: np.ndarray
+    y_train_raw: np.ndarray
+    y_val_raw: np.ndarray
+
+
+@dataclass
+class PipelineRunner:
+    settings: RunSettings
+    run_id: str
+    run_dir: Path
+    log: Any = field(repr=False)
+
+    @classmethod
+    def create(
+        cls,
+        preset: str = "paper",
+        run_id: str | None = None,
+        mode: str = "hybrid",
+        resume: bool = False,
+    ) -> PipelineRunner:
+        settings = load_settings(preset)
+
+        if resume:
+            rid = run_id
+            if rid in (None, "latest"):
+                rid = resolve_run_dir(settings.runs_dir, "latest").name
+            run_dir = settings.runs_dir / rid
+            if not run_dir.exists():
+                raise FileNotFoundError(
+                    f"Cannot resume: run directory not found at {run_dir}"
+                )
+            settings.logs_dir.mkdir(parents=True, exist_ok=True)
+            run_log = settings.logs_dir / f"{rid}.log"
+            setup_logging(settings, rid, run_log)
+            log = get_stage_logger("runner")
+            configure_fitness_logging(settings.fitness_eval_log_interval)
+            configure_tensorflow_runtime()
+            log.info(
+                "Resuming pipeline | preset=%s mode=%s run_id=%s",
+                preset,
+                mode,
+                rid,
+            )
+            return cls(settings=settings, run_id=rid, run_dir=run_dir, log=log)
+
+        rid = run_id or new_run_id()
+        settings.logs_dir.mkdir(parents=True, exist_ok=True)
+        run_log = settings.logs_dir / f"{rid}.log"
+        setup_logging(settings, rid, run_log)
+        log = get_stage_logger("runner")
+        run_dir = init_run(settings.runs_dir, rid, preset, mode)
+        configure_fitness_logging(settings.fitness_eval_log_interval)
+        configure_tensorflow_runtime()
+        log.info(
+            "Pipeline started | preset=%s mode=%s run_id=%s",
+            preset,
+            mode,
+            rid,
+        )
+        return cls(settings=settings, run_id=rid, run_dir=run_dir, log=log)
+
+    # ── data ──────────────────────────────────────────────
+
+    def ensure_preprocessed(self, force: bool = False) -> None:
+        with self._stage("preprocess"):
+            required = [
+                self.settings.processed_dir / "X_train.npy",
+                self.settings.processed_dir / "y_train.npy",
+            ]
+            if force or not all(p.exists() for p in required):
+                self.log.info("Running preprocessing pipeline")
+                run_preprocessing(str(self.settings.raw_data))
+            else:
+                self.log.info("Processed data already present — skipping")
+
+    def load_data(self) -> DatasetBundle:
+        p = self.settings.processed_dir
+        return DatasetBundle(
+            X_train=np.load(p / "X_train.npy"),
+            y_train=np.load(p / "y_train.npy"),
+            X_val=np.load(p / "X_val.npy"),
+            y_val=np.load(p / "y_val.npy"),
+            X_test=np.load(p / "X_test.npy"),
+            y_test=np.load(p / "y_test.npy"),
+            y_test_raw=np.load(p / "y_test_raw.npy"),
+            y_train_raw=np.load(p / "y_train_raw.npy"),
+            y_val_raw=np.load(p / "y_val_raw.npy"),
+        )
+
+    def _bind_fitness_data(self, data: DatasetBundle) -> None:
+        set_data(data.X_train, data.y_train, data.X_val, data.y_val)
+
+    # ── training stages ─────────────────────────────────────
+
+    def run_baseline(self, data: DatasetBundle) -> str:
+        """NO-CNN baseline (Table 7)."""
+        key = "NO-CNN"
+        with self._stage(key):
+            hp = decode_hyperparameters(
+                [1, 1, 1, 2, 0.3, 0.001, 2, 0, 50]
+            )
+            model = train_model_with_retries(
+                hp,
+                data.X_train,
+                data.y_train,
+                data.X_val,
+                data.y_val,
+                n_attempts=self.settings.train_attempts_standalone,
+                verbose=True,
+                label=key,
+            )
+            self._persist_model(key, model, hp, curve=None)
+            release_model(model, label=key)
+        return key
+
+    def run_standalone(self, data: DatasetBundle, algorithm: str) -> str:
+        """One standalone optimizer — paper Section 4.2 (30 iterations)."""
+        algo = algorithm.lower()
+        if algo not in STANDALONE_ALGOS:
+            raise ValueError(
+                f"Unknown algorithm '{algorithm}'. "
+                f"Choose: {', '.join(STANDALONE_ALGOS)}"
+            )
+        model_key, runner, curve_key = STANDALONE_ALGOS[algo]
+        with self._stage(model_key):
+            self._bind_fitness_data(data)
+            reset_history()
+            self.log.info(
+                "Optimising %s | pop=%d iter=%d",
+                model_key,
+                self.settings.population_size,
+                self.settings.standalone_iterations,
+            )
+            best_pos, best_fit, curve = runner(
+                self.settings.population_size,
+                self.settings.standalone_iterations,
+                LOWER_BOUNDS,
+                UPPER_BOUNDS,
+                verbose=True,
+            )
+            hp = decode_hyperparameters(best_pos)
+            self.log.info(
+                "%s best fitness=%.4f val_acc=%.2f%%",
+                model_key,
+                best_fit,
+                (1 - best_fit) * 100,
+            )
+            model = train_model_with_retries(
+                hp,
+                data.X_train,
+                data.y_train,
+                data.X_val,
+                data.y_val,
+                n_attempts=self.settings.train_attempts_standalone,
+                verbose=True,
+                label=model_key,
+            )
+            self._persist_model(model_key, model, hp, curve, curve_key)
+            release_model(model, label=model_key)
+            cleanup_after_stage(model_key)
+        return model_key
+
+    def run_hybrid(self, data: DatasetBundle) -> str:
+        """GWO→WOA→AOA hybrid — paper Section 3.2.4 (~35 min on paper hardware)."""
+        key = "GWO-WOA-AOA-CNN"
+        with self._stage(key):
+            self._bind_fitness_data(data)
+            reset_history()
+            it = self.settings.hybrid_iterations_per_stage
+            self.log.info(
+                "Hybrid optimisation | pop=%d stages=%d+%d+%d",
+                self.settings.population_size,
+                it,
+                it,
+                it,
+            )
+            hybrid = HybridOptimizer(
+                population_size=self.settings.population_size,
+                gwo_iterations=it,
+                woa_iterations=it,
+                aoa_iterations=it,
+                lower_bounds=LOWER_BOUNDS,
+                upper_bounds=UPPER_BOUNDS,
+            )
+            best_hp, best_fitness, curve = hybrid.optimize(
+                data.X_train,
+                data.y_train,
+                data.X_val,
+                data.y_val,
+                verbose=True,
+            )
+            self.log.info(
+                "Hybrid best fitness=%.4f val_acc=%.2f%%",
+                best_fitness,
+                (1 - best_fitness) * 100,
+            )
+            model = hybrid.train_final_model(
+                data.X_train,
+                data.y_train,
+                data.X_val,
+                data.y_val,
+                verbose=True,
+                n_attempts=self.settings.train_attempts_final,
+            )
+            self._persist_model(
+                key, model, best_hp, curve, "GWO-WOA-AOA"
+            )
+            release_model(model, label=key)
+            cleanup_after_stage(key)
+        return key
+
+    def run_compare(self, data: DatasetBundle, *, resume: bool = False) -> list[str]:
+        """
+        Table 7 comparison — each optimizer run sequentially with cleanup.
+        Paper Section 4.2: standalone 30 iter each + hybrid.
+
+        With resume=True, skips models that already have model.keras saved.
+        """
+        completed: list[str] = []
+        for model_key, mode, algo in COMPARE_STAGES:
+            if resume and model_artifact_exists(self.run_dir, model_key):
+                self.log.info(
+                    "Skipping %s — artifact already exists (resume)",
+                    model_key,
+                )
+                completed.append(model_key)
+                continue
+
+            if mode == "baseline":
+                self.run_baseline(data)
+            elif mode == "standalone":
+                assert algo is not None
+                self.run_standalone(data, algo)
+            elif mode == "hybrid":
+                self.run_hybrid(data)
+            completed.append(model_key)
+        return completed
+
+    # ── post-training analysis (separate commands) ──────────
+
+    def evaluate_run(self, data: DatasetBundle | None = None) -> dict:
+        """Load saved models from this run and produce Table 7 outputs."""
+        with self._stage("evaluate"):
+            if data is None:
+                data = self.load_data()
+            models_dict = {}
+            hp_dict = {}
+            convergence_curves = {}
+
+            for key in list_saved_models(self.run_dir):
+                self.log.info("Loading saved model: %s", key)
+                models_dict[key] = load_keras_model(self.run_dir, key)
+                hp_path = self.run_dir / key / "hyperparameters.json"
+                if hp_path.exists():
+                    hp_dict[key] = json.loads(
+                        hp_path.read_text(encoding="utf-8")
+                    )
+                conv_path = self.run_dir / key / "convergence.json"
+                if conv_path.exists():
+                    payload = json.loads(
+                        conv_path.read_text(encoding="utf-8")
+                    )
+                    curve_key = key.replace("-CNN", "").replace(
+                        "GWO-WOA-AOA", "GWO-WOA-AOA"
+                    )
+                    if key == "GWO-WOA-AOA-CNN":
+                        curve_key = "GWO-WOA-AOA"
+                    elif key.endswith("-CNN"):
+                        curve_key = key.replace("-CNN", "")
+                    convergence_curves[curve_key] = payload.get(
+                        "curve", []
+                    )
+
+            ordered = {
+                k: models_dict[k]
+                for k in TABLE7_ORDER
+                if k in models_dict
+            }
+            if not ordered:
+                raise RuntimeError(
+                    f"No models found in {self.run_dir}. Run training first."
+                )
+
+            results = run_full_evaluation(
+                models_dict=ordered,
+                X_test=data.X_test,
+                y_test_cat=data.y_test,
+                y_test_raw=data.y_test_raw,
+                convergence_curves=convergence_curves or None,
+                hp_dict=hp_dict or None,
+            )
+
+            out = self.settings.outputs_dir / "results" / (
+                f"metrics_{self.run_id}.json"
+            )
+            out.parent.mkdir(parents=True, exist_ok=True)
+            serializable = {
+                k: {mk: mv for mk, mv in v.items() if mk != "cm"}
+                for k, v in results.items()
+            }
+            out.write_text(
+                json.dumps(serializable, indent=2, default=str),
+                encoding="utf-8",
+            )
+            self.log.info("Metrics saved -> %s", out)
+
+            for model in models_dict.values():
+                release_model(model)
+            cleanup_after_stage("evaluate")
+            return results
+
+    def run_shap(self, data: DatasetBundle | None = None) -> None:
+        """SHAP analysis on hybrid model — paper Section 4.4."""
+        with self._stage("shap"):
+            if data is None:
+                data = self.load_data()
+            key = "GWO-WOA-AOA-CNN"
+            model = load_keras_model(self.run_dir, key)
+            self.log.info(
+                "SHAP | background=%d explain=%d",
+                self.settings.shap_n_background,
+                self.settings.shap_n_explain,
+            )
+            run_shap_analysis(
+                model=model,
+                X_train=data.X_train,
+                X_test=data.X_test,
+                n_background=self.settings.shap_n_background,
+                n_explain=self.settings.shap_n_explain,
+            )
+            release_model(model, label=key)
+            cleanup_after_stage("shap")
+
+    def run_smote(self, data: DatasetBundle | None = None) -> None:
+        """SMOTE augmentation study — paper Section 4.5."""
+        with self._stage("smote"):
+            if data is None:
+                data = self.load_data()
+            key = "GWO-WOA-AOA-CNN"
+            hp_path = self.run_dir / key / "hyperparameters.json"
+            if not hp_path.exists():
+                raise FileNotFoundError(
+                    f"Hybrid hyperparameters not found at {hp_path}"
+                )
+            best_hp = json.loads(hp_path.read_text(encoding="utf-8"))
+            scaler = joblib.load(self.settings.models_dir / "scaler.pkl")
+            run_smote_analysis(
+                best_hyperparams=best_hp,
+                X_train_raw=data.X_train,
+                y_train_raw=data.y_train_raw,
+                X_val_raw=data.X_val,
+                y_val_raw=data.y_val_raw,
+                X_test_raw=data.X_test,
+                y_test_raw=data.y_test_raw,
+                scaler=scaler,
+                framingham_path=None,
+                n_attempts=self.settings.smote_n_attempts,
+            )
+            cleanup_after_stage("smote")
+
+    def finish(self, status: str = "completed") -> None:
+        finalize_run(self.run_dir, status=status)
+        self.log.info("Pipeline finished | status=%s run_id=%s", status, self.run_id)
+
+    # ── helpers ─────────────────────────────────────────────
+
+    def _persist_model(
+        self,
+        model_key: str,
+        model,
+        hp: dict,
+        curve: list | None,
+        curve_key: str | None = None,
+    ) -> None:
+        save_hyperparameters(self.run_dir, model_key, hp)
+        if curve is not None:
+            save_convergence(self.run_dir, model_key, curve)
+        save_keras_model(self.run_dir, model_key, model)
+        register_artifact(self.run_dir, model_key)
+
+    @contextmanager
+    def _stage(self, name: str):
+        self.log = get_stage_logger(name)
+        self.log.info("Stage started: %s", name)
+        t0 = time.perf_counter()
+        error = None
+        try:
+            yield
+            status = "completed"
+        except Exception as exc:
+            error = exc
+            status = "failed"
+            self.log.exception("Stage failed: %s — %s", name, exc)
+            record_stage(
+                self.run_dir,
+                name,
+                status=status,
+                duration_sec=time.perf_counter() - t0,
+                details={"error": str(exc)},
+            )
+            finalize_run(self.run_dir, status="failed")
+            raise
+        else:
+            duration = time.perf_counter() - t0
+            record_stage(
+                self.run_dir,
+                name,
+                status=status,
+                duration_sec=duration,
+            )
+            self.log.info(
+                "Stage completed: %s in %.1f s (%.1f min)",
+                name,
+                duration,
+                duration / 60,
+            )
+
+
+def load_runner_for_eval(
+    preset: str, run_id: str | None
+) -> tuple[PipelineRunner, Path]:
+    settings = load_settings(preset)
+    run_dir = resolve_run_dir(settings.runs_dir, run_id)
+    rid = run_dir.name
+    setup_logging(settings, rid, settings.logs_dir / f"{rid}.log")
+    return (
+        PipelineRunner(
+            settings=settings,
+            run_id=rid,
+            run_dir=run_dir,
+            log=get_stage_logger("evaluate"),
+        ),
+        run_dir,
+    )

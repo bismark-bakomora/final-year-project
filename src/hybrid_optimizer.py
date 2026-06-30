@@ -1,5 +1,3 @@
-from tabnanny import verbose
-
 import numpy as np
 import time
 from src.gwo import GWO

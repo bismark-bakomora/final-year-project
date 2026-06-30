@@ -1,307 +1,589 @@
-# Heart Disease Prediction using Hybrid Optimizer (GWO-WOA-AOA) and CNN
+# Heart Disease Prediction using Hybrid GWO-WOA-AOA CNN
 
-A final year project implementing a hybrid meta-heuristic optimization approach combining Grey Wolf Optimizer (GWO), Whale Optimization Algorithm (WOA), and Artificial Orca Algorithm (AOA) to optimize CNN hyperparameters for heart disease prediction.
+A final-year research implementation that reproduces and extends the hybrid metaheuristic approach described in:
 
-## 📋 Project Overview
+> **Lale et al.** — *A novel hybrid metaheuristic for optimizing hyperparameters of convolutional neural network in heart disease prediction* (Cluster Computing, 2026).
 
-This project uses a sequential three-stage hybrid optimization framework to automatically tune CNN hyperparameters for binary classification of heart disease. The hybrid optimizer is compared against a baseline NO-CNN model to demonstrate the effectiveness of the optimization approach.
+The system automatically tunes a 2D convolutional neural network (CNN) for binary heart-disease classification using a **sequential three-stage optimizer**: Grey Wolf Optimizer (GWO) → Whale Optimization Algorithm (WOA) → Arithmetic Optimization Algorithm (AOA). Results are compared against standalone optimizers (GWO, WOA, AOA, RIME) and a non-optimised baseline (NO-CNN).
 
-**Key Features:**
-- **Hybrid Optimization**: Sequential GWO → WOA → AOA pipeline for comprehensive hyperparameter search
-- **CNN Model**: Convolutional Neural Network with customizable filters, kernels, pooling, and dense layers
-- **Comprehensive Evaluation**: Metrics, visualizations, confusion matrices, and ROC curves
-- **Explainability**: SHAP integration for model interpretability
+This repository is structured as an **industry-style ML pipeline**: staged CLI commands, central configuration, structured logging, on-disk artifacts, and memory-safe execution so long experiments do not exhaust RAM or terminate silently.
 
-## 📁 Project Structure
+---
+
+## Table of contents
+
+1. [What this project does](#what-this-project-does)
+2. [Scientific background](#scientific-background)
+3. [System architecture](#system-architecture)
+4. [Dataset](#dataset)
+5. [Installation](#installation)
+6. [Quick start](#quick-start)
+7. [CLI reference](#cli-reference)
+8. [Configuration](#configuration)
+9. [Pipeline stages explained](#pipeline-stages-explained)
+10. [Outputs and artifacts](#outputs-and-artifacts)
+11. [Expected runtimes](#expected-runtimes)
+12. [Project structure](#project-structure)
+13. [Reproducing paper results](#reproducing-paper-results)
+14. [Troubleshooting](#troubleshooting)
+15. [References](#references)
+
+---
+
+## What this project does
+
+| Goal | How |
+|------|-----|
+| Predict heart disease (yes/no) | 2D-CNN on 11 clinical features |
+| Find best CNN hyperparameters | Metaheuristic search minimising \(f(x) = 1 - \text{validation accuracy}\) |
+| Compare methods | NO-CNN, GWO-CNN, WOA-CNN, AOA-CNN, RIME-CNN, GWO-WOA-AOA-CNN (Table 7) |
+| Explain predictions | SHAP analysis on the hybrid model (Section 4.4) |
+| Test data augmentation | SMOTE on original, balanced, and double-balanced sets (Section 4.5) |
+
+**Important design choice:** The reference paper reports ~25–36 minutes **per individual optimizer run**. This project runs **one experiment per CLI command**, saves models to disk, and frees memory between stages. That matches the paper’s methodology and avoids the multi-hour, out-of-memory failures caused by running everything in a single script.
+
+For a detailed runtime analysis, see `docs/Runtime_Analysis_Report.docx`.
+
+---
+
+## Scientific background
+
+### The hybrid optimizer (Section 3.2.4)
+
+The proposed method chains three nature-inspired algorithms:
 
 ```
-heart_disease_prediction/
-├── main.py                    # Entry point for the pipeline
-├── requirements.txt           # Python dependencies
-├── README.md                  # This file
-├── .gitignore                 # Git ignore rules
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  GWO stage  │ ──► │  WOA stage  │ ──► │  AOA stage  │
+│ Exploration │     │ Exploitation│     │ Fine-tuning │
+│ 10 iter     │     │ 10 iter     │     │ 10 iter     │
+└─────────────┘     └─────────────┘     └─────────────┘
+       │                   │                   │
+       └───────────────────┴───────────────────┘
+                           │
+                    Best hyperparameters
+                           │
+                    Final CNN model
+```
+
+- **GWO** (Section 3.2.1): global search across the hyperparameter space.
+- **WOA** (Section 3.2.2): local refinement starting from GWO’s best solution.
+- **AOA** (Section 3.2.3): precise fine-tuning starting from WOA’s best solution.
+
+Each stage uses population size **ps = 20**. In hybrid mode each stage runs **10 iterations** (30 total). Standalone comparison algorithms run **30 iterations** each (Section 4.2).
+
+### Fitness function (Equation 23, Section 3.3.2)
+
+The optimisers minimise:
+
+\[
+f(x) = 1 - \frac{TP + TN}{TP + TN + FP + FN} = 1 - \text{validation accuracy}
+\]
+
+For each candidate hyperparameter vector \(x\), a CNN is built, trained on the training set (with early stopping on validation loss, patience = 5), and evaluated on the validation set. Lower fitness is better; 0 means perfect validation accuracy.
+
+### CNN architecture (Section 3.3.1, Figure 7)
+
+- Input shape: `(11, 1, 1)` — eleven features as a 2D tensor.
+- Four blocks: `Conv2D → BatchNorm → ReLU → MaxPooling2D`.
+- `GlobalAveragePooling2D` → dense layer → dropout → softmax (2 classes).
+
+Nine hyperparameters are optimised (Table 5): filter configuration, kernel size, pooling size, FC neurons, dropout, learning rate, batch size, optimizer, and max epochs.
+
+---
+
+## System architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                         main.py (CLI)                            │
+└────────────────────────────┬─────────────────────────────────────┘
+                             │
+┌────────────────────────────▼─────────────────────────────────────┐
+│                    src/pipeline.py                               │
+│  Orchestrates stages · logging · artifacts · memory cleanup      │
+└─┬──────────┬──────────┬──────────┬──────────┬────────────────────┘
+  │          │          │          │          │
+  ▼          ▼          ▼          ▼          ▼
+preprocess  hybrid/    fitness    evaluate   shap / smote
+            standalone  + CNN      + plots    (optional)
+            optimizers
+```
+
+### Core modules
+
+| Module | Responsibility |
+|--------|----------------|
+| `config.yaml` / `src/config.py` | Central settings (`paper` vs `quick` presets) |
+| `src/logging_config.py` | Console + rotating file logs with stage tags |
+| `src/memory_utils.py` | TensorFlow session cleanup between stages |
+| `src/artifacts.py` | Save models, hyperparameters, run manifests |
+| `src/pipeline.py` | End-to-end orchestration |
+| `src/preprocess.py` | Data loading, cleaning, splitting, scaling |
+| `src/cnn_model.py` | Dynamic CNN build/train; hyperparameter decode |
+| `src/fitness.py` | Fitness evaluations during optimisation |
+| `src/hybrid_optimizer.py` | GWO → WOA → AOA chain |
+| `src/gwo.py`, `woa.py`, `aoa.py`, `rime.py` | Individual optimisers |
+| `src/evaluate.py` | Metrics, confusion matrices, ROC, convergence plots |
+| `src/shap_analysis.py` | SHAP explainability (Section 4.4) |
+| `src/smote_analysis.py` | SMOTE experiments (Section 4.5) |
+
+---
+
+## Dataset
+
+**Source:** Combined Cleveland + Hungary heart disease data (Statlog format).
+
+| Property | Value |
+|----------|-------|
+| File | `data/raw/heart_statlog_cleveland_hungary_final.csv` |
+| Samples | 1,190 |
+| Features | 11 (age, sex, chest pain type, resting BP, cholesterol, fasting blood sugar, resting ECG, max heart rate, exercise angina, oldpeak, ST slope) |
+| Target | Binary: 0 = no disease, 1 = disease |
+| Split | 70% train / 10% validation / 20% test (stratified, Section 3.1) |
+| Scaling | Z-score normalisation (fit on train only) |
+
+Preprocessing handles invalid values (e.g. resting BP = 0, ST slope = 0) via median imputation or clipping, as described in Section 3.1.2.
+
+---
+
+## Installation
+
+### Requirements
+
+- **Python 3.11** (required for TensorFlow 2.15 on Windows)
+- **16 GB RAM** recommended (paper hardware: Intel i7-6500U, 16 GB)
+- CPU execution is supported; GPU is optional
+
+### Steps
+
+```powershell
+# Clone or navigate to the project
+cd final-year-project
+
+# Create virtual environment (must use Python 3.11)
+py -3.11 -m venv venv311
+
+# Activate (Windows PowerShell)
+.\venv311\Scripts\Activate.ps1
+
+# Verify Python version
+python --version   # should show 3.11.x
+
+# Install dependencies (~300 MB download for TensorFlow)
+pip install --upgrade pip
+pip install -r requirements.txt --default-timeout=1000
+
+# Verify TensorFlow
+python -c "import tensorflow as tf; print('TensorFlow', tf.__version__)"
+```
+
+If the TensorFlow download times out, retry with a longer timeout or use a stable network connection. The wheel is ~300 MB.
+
+---
+
+## Quick start
+
+### 1. Prepare data (run once)
+
+```powershell
+python main.py preprocess
+```
+
+Creates `data/processed/*.npy` and `models/scaler.pkl`.
+
+### 2. Smoke test (~5 minutes)
+
+Confirms the pipeline works end-to-end with tiny populations:
+
+```powershell
+python main.py run hybrid --preset quick --evaluate
+```
+
+### 3. Paper hybrid run (~35 minutes)
+
+Reproduces the paper’s main method (Section 4.2):
+
+```powershell
+python main.py run hybrid --preset paper --evaluate
+```
+
+Or use the helper script:
+
+```powershell
+.\scripts\run_paper_hybrid.ps1
+```
+
+### 4. Optional follow-up analyses
+
+Run **after** a successful hybrid or compare run:
+
+```powershell
+python main.py shap --run-id latest
+python main.py smote --run-id latest
+```
+
+---
+
+## CLI reference
+
+```
+python main.py [--preset paper|quick] [--run-id ID] <command> [options]
+```
+
+### Commands
+
+| Command | Description | Paper reference |
+|---------|-------------|-----------------|
+| `preprocess` | Load, clean, split, and normalise data | Section 3.1 |
+| `run hybrid` | GWO→WOA→AOA optimisation + final model | Sections 3.2.4, 4.2 |
+| `run baseline` | NO-CNN baseline (fixed hyperparameters) | Table 7 |
+| `run standalone <algo>` | One standalone optimiser (`gwo`, `woa`, `aoa`, `rime`) | Section 4.2 |
+| `run compare` | All Table 7 models, run sequentially | Section 4.2 |
+| `evaluate` | Test-set metrics and figures for a saved run | Table 7, Figures 8–10 |
+| `shap` | SHAP explainability on hybrid model | Section 4.4 |
+| `smote` | SMOTE augmentation study | Section 4.5 |
+
+### `run` modes
+
+```powershell
+python main.py run hybrid   [--evaluate] [--force-preprocess]
+python main.py run baseline
+python main.py run standalone --algorithm gwo
+python main.py run compare  [--evaluate]
+```
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--preset paper` | Full paper settings (default) |
+| `--preset quick` | Small populations for testing |
+| `--run-id ID` | Custom run identifier (default: UTC timestamp) |
+| `--evaluate` | Run test-set evaluation after training |
+| `--force-preprocess` | Rebuild processed data even if it exists |
+
+### Examples
+
+```powershell
+# Single standalone algorithm (30 iterations, ~26–31 min)
+python main.py run standalone --algorithm gwo --preset paper --evaluate
+
+# Full Table 7 comparison (~2.5 hours, memory-safe)
+python main.py run compare --preset paper --evaluate
+
+# Re-evaluate a previous run without retraining
+python main.py evaluate --run-id latest
+
+# Re-evaluate a specific run
+python main.py evaluate --run-id 20250629_143022
+```
+
+---
+
+## Configuration
+
+All settings live in `config.yaml`. Two presets are provided:
+
+### `paper` preset (default)
+
+Matches Section 4.2 experimental setup:
+
+| Setting | Value |
+|---------|-------|
+| Population size | 20 |
+| Hybrid iterations per stage | 10 (30 total) |
+| Standalone iterations | 30 |
+| Final model training attempts | 3 |
+| Standalone training attempts | 1 |
+| Early stopping patience | 5 |
+
+### `quick` preset
+
+For development and CI-style smoke tests:
+
+| Setting | Value |
+|---------|-------|
+| Population size | 3 |
+| Hybrid iterations per stage | 2 |
+| Standalone iterations | 2 |
+| Training attempts | 1 |
+
+### Other settings
+
+```yaml
+shap:
+  n_background: 50    # SHAP background samples
+  n_explain: 100      # test samples to explain
+
+smote:
+  n_attempts: 3       # training retries per dataset config
+
+logging:
+  level: INFO
+  max_bytes: 10485760 # 10 MB rotating log files
+```
+
+Edit `config.yaml` to tune these without changing code.
+
+---
+
+## Pipeline stages explained
+
+### Preprocessing (`preprocess`)
+
+1. Load CSV and verify categorical encodings.
+2. Handle missing/invalid values.
+3. Stratified split: 70% / 10% / 20%.
+4. Z-score scaling (train statistics only).
+5. Reshape to `(N, 11, 1, 1)` for Conv2D.
+6. One-hot encode labels.
+7. Save arrays to `data/processed/`.
+
+### Training (`run`)
+
+Each training command:
+
+1. Initialises a **run directory** under `outputs/runs/<run_id>/`.
+2. Starts **structured logging** to console and `outputs/logs/<run_id>.log`.
+3. Runs the requested optimisation (if applicable).
+4. Trains the final CNN with the best hyperparameters.
+5. **Saves** `model.keras`, `hyperparameters.json`, and `convergence.json`.
+6. **Releases** the model from memory before the next stage.
+7. Updates `manifest.json` with stage timings and status.
+
+### Evaluation (`evaluate`)
+
+1. Loads saved models from the run directory.
+2. Computes accuracy, F1, sensitivity, precision, NPV, MCC, Kappa (Section 4.1).
+3. Writes figures to `outputs/figures/` and CSV to `outputs/results/`.
+
+### SHAP (`shap`)
+
+GradientExplainer analysis on the hybrid model. Run separately because it is memory-intensive and not part of the paper’s optimisation timing.
+
+### SMOTE (`smote`)
+
+Trains the hybrid model on three dataset configurations (original, balanced, double-balanced) and reports Table 10 metrics. Also run separately.
+
+---
+
+## Outputs and artifacts
+
+After a run you will find:
+
+```
+outputs/
+├── logs/
+│   └── 20250629_143022.log          # Full timestamped log
+├── runs/
+│   ├── latest_run.txt               # Points to most recent run
+│   └── 20250629_143022/
+│       ├── manifest.json            # Stage status, durations, errors
+│       ├── NO-CNN/
+│       │   ├── model.keras
+│       │   └── hyperparameters.json
+│       ├── GWO-WOA-AOA-CNN/
+│       │   ├── model.keras
+│       │   ├── hyperparameters.json
+│       │   └── convergence.json
+│       └── ...
+├── figures/
+│   ├── confusion_matrices.png       # Figure 9
+│   ├── roc_curves.png               # Figure 10
+│   ├── convergence_curves.png       # Figure 8
+│   ├── performance_comparison.png
+│   ├── shap_importance.png          # Figure 14 (after shap command)
+│   └── dataset_comparison.png       # Figure 16 (after smote command)
+└── results/
+    ├── metrics_comparison.csv       # Table 7
+    ├── hyperparameters.csv          # Table 6
+    └── metrics_<run_id>.json
+```
+
+### `manifest.json` example
+
+```json
+{
+  "run_id": "20250629_143022",
+  "preset": "paper",
+  "mode": "hybrid",
+  "status": "completed",
+  "stages": {
+    "GWO-WOA-AOA-CNN": {
+      "status": "completed",
+      "duration_sec": 2134.5
+    },
+    "evaluate": {
+      "status": "completed",
+      "duration_sec": 12.3
+    }
+  }
+}
+```
+
+If a stage fails, `status` becomes `"failed"` and the error is recorded — check the log file for the full traceback.
+
+---
+
+## Expected runtimes
+
+On hardware similar to the paper (Intel i7-6500U, 16 GB RAM, CPU):
+
+| Command | Approximate time |
+|---------|------------------|
+| `preprocess` | < 1 min |
+| `run hybrid --preset quick` | ~5 min |
+| `run hybrid --preset paper` | ~35 min |
+| `run standalone --algorithm gwo --preset paper` | ~27 min |
+| `run compare --preset paper` | ~2.5 h |
+| `shap --run-id latest` | 30 min – 2 h |
+| `smote --run-id latest` | ~45 min – 1.5 h |
+
+These align with the paper’s reported optimisation times (Section 4.2): RIME 30.8 min, AOA 25.4 min, GWO 26.9 min, WOA 28.3 min, hybrid 35.6 min.
+
+---
+
+## Project structure
+
+```
+final-year-project/
+├── main.py                          # CLI entry point
+├── config.yaml                      # Central configuration
+├── requirements.txt
+├── README.md
 │
 ├── data/
-│   ├── raw/
-│   │   └── heart_statlog_cleveland_hungary_final.csv
-│   └── processed/
-│       ├── X_train.npy, X_val.npy, X_test.npy
-│       ├── y_train.npy, y_val.npy, y_test.npy
-│       └── y_*_raw.npy (original labels)
+│   ├── raw/                         # Original CSV (not generated)
+│   └── processed/                   # Generated .npy arrays (gitignored)
 │
 ├── models/
-│   └── best_model.h5          # Trained CNN model weights
+│   └── scaler.pkl                   # Fitted StandardScaler (gitignored)
 │
-├── src/
-│   ├── __init__.py
-│   ├── preprocess.py          # Data preprocessing and train/val/test split
-│   ├── cnn_model.py           # CNN architecture and hyperparameter space
-│   ├── hybrid_optimizer.py    # Main hybrid GWO-WOA-AOA optimizer
-│   ├── gwo.py                 # Grey Wolf Optimizer implementation
-│   ├── woa.py                 # Whale Optimization Algorithm implementation
-│   ├── aoa.py                 # Artificial Orca Algorithm implementation
-│   ├── fitness.py             # Fitness function for optimization
-│   └── evaluate.py            # Model evaluation and visualization
+├── outputs/                         # Logs, runs, figures, results (gitignored)
 │
-├── notebooks/
-│   ├── 01_eda.ipynb           # Exploratory Data Analysis
-│   ├── 02_baseline.ipynb      # Baseline model experiments
-│   └── 03_results_analysis.ipynb  # Results visualization and analysis
+├── docs/
+│   ├── Runtime_Analysis_Report.docx # Why old single-script runs were slow
+│   └── figures/
 │
-├── outputs/
-│   ├── figures/
-│   │   ├── confusion_matrices.png
-│   │   ├── roc_curves.png
-│   │   ├── convergence_curves.png
-│   │   └── performance_comparison.png
-│   └── results/
-│       ├── metrics_comparison.csv
-│       └── hyperparameters.csv
+├── scripts/
+│   ├── run_paper_hybrid.ps1         # One-click paper hybrid run
+│   └── generate_runtime_analysis_doc.py
 │
-└── tests/
-    ├── test_preprocess.py
-    ├── test_cnn_model.py
-    └── test_optimizers.py
+└── src/
+    ├── config.py
+    ├── logging_config.py
+    ├── memory_utils.py
+    ├── artifacts.py
+    ├── pipeline.py
+    ├── preprocess.py
+    ├── cnn_model.py
+    ├── fitness.py
+    ├── hybrid_optimizer.py
+    ├── standalone_optimizers.py
+    ├── gwo.py, woa.py, aoa.py, rime.py
+    ├── evaluate.py
+    ├── shap_analysis.py
+    └── smote_analysis.py
 ```
 
-## 🚀 Getting Started
+---
 
-### Prerequisites
-- Python 3.11+
-- pip package manager
-- Git
+## Reproducing paper results
 
-### Installation
+Recommended order for a full thesis reproduction:
 
-1. **Clone the repository**:
-   ```bash
-   git clone <repository-url>
-   cd heart_disease_prediction
-   ```
+| Step | Command | Produces |
+|------|---------|----------|
+| 1 | `python main.py preprocess` | Processed data |
+| 2 | `python main.py run compare --preset paper --evaluate` | Table 7, Figures 8–10 |
+| 3 | `python main.py shap --run-id latest` | Figures 14–15 |
+| 4 | `python main.py smote --run-id latest` | Table 10, Figure 16 |
 
-2. **Create a virtual environment**:
-   ```bash
-   python -m venv venv311
-   ```
+If time is limited, **Step 2 can be replaced** with:
 
-3. **Activate the virtual environment**:
-   - **Windows (PowerShell)**:
-     ```powershell
-     .\venv311\Scripts\Activate.ps1
-     ```
-   - **Windows (CMD)**:
-     ```cmd
-     .\venv311\Scripts\activate.bat
-     ```
-   - **Linux/macOS**:
-     ```bash
-     source venv311/bin/activate
-     ```
-
-4. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## 📊 Dataset
-
-**Heart Disease Dataset** (Cleveland-Hungary combined)
-- **Source**: Statlog (Heart) Database
-- **Samples**: ~1000 records
-- **Features**: 13 clinical and demographic attributes
-- **Target**: Binary classification (0: no disease, 1: disease present)
-- **Splits**: 70% training, 15% validation, 15% testing
-
-### Preprocessing Steps:
-1. Handle missing values
-2. Feature scaling (StandardScaler)
-3. SMOTE for class imbalance handling
-4. Train/validation/test split
-
-## 🔧 Running the Project
-
-### Quick Test (Small Population)
-
-Run the main pipeline with reduced population for quick testing:
-
-```bash
-python main.py
+```powershell
+python main.py run hybrid --preset paper --evaluate
 ```
 
-This will:
-1. Preprocess the raw data
-2. Run hybrid optimization with small population (population_size=3, iterations=2 for each algorithm)
-3. Train the final model
-4. Train a NO-CNN baseline
-5. Evaluate both models
-6. Generate visualizations and metrics
+That reproduces the paper’s main hybrid result (~96% accuracy target) in ~35 minutes.
 
-**Output**: Check `outputs/` folder for results:
-- `outputs/figures/`: Visualization plots
-- `outputs/results/`: CSV metrics and hyperparameters
+### Hyperparameter search space (Table 5)
 
-### Full Optimization (Production Settings)
+| Hyperparameter | Search range |
+|----------------|--------------|
+| Conv2D filters | [8,16,32,64], [16,32,64,128], [32,64,128,256], [64,128,256,512] |
+| Kernel size | 3, 5, 7, 9, 11 |
+| Pooling size | 2, 3, 4, 5, 6 |
+| FC neurons | 16, 32, 64, 128, 256 |
+| Dropout | 0.1 – 0.5 |
+| Learning rate | 0.0001 – 0.01 |
+| Batch size | 8, 16, 32, 64, 100, 128 |
+| Optimizer | adam, sgd, rmsprop |
+| Max epochs | 10 – 50 |
 
-Edit `main.py` to use production parameters:
-```python
-hybrid = HybridOptimizer(
-    population_size=20,      # full: 20
-    gwo_iterations=10,       # full: 10
-    woa_iterations=10,       # full: 10
-    aoa_iterations=10,       # full: 10
-    lower_bounds=LOWER_BOUNDS,
-    upper_bounds=UPPER_BOUNDS
-)
+---
+
+## Troubleshooting
+
+### `ModuleNotFoundError: No module named 'tensorflow'`
+
+Activate the virtual environment and install dependencies:
+
+```powershell
+.\venv311\Scripts\Activate.ps1
+pip install -r requirements.txt --default-timeout=1000
 ```
 
-## 📈 Hyperparameter Search Space
+### `No matching distribution found for tensorflow==2.15.0`
 
-The hybrid optimizer tunes these CNN hyperparameters (9-dimensional search space):
+Your venv is likely **not** Python 3.11. Recreate it:
 
-| Parameter | Options | Type |
-|-----------|---------|------|
-| Filter Config | [0-3] | Integer |
-| Kernel Size | [3,5,7,9,11] | Integer |
-| Pooling Size | [2,3,4,5,6] | Integer |
-| Dense Neurons | [16,32,64,128,256] | Integer |
-| Dropout Rate | [0.1 - 0.5] | Continuous |
-| Learning Rate | [0.0001 - 0.01] | Continuous |
-| Batch Size | [8,16,32,64,100,128] | Integer |
-| Optimizer | ['adam', 'sgd', 'rmsprop'] | Categorical |
-| Max Epochs | [10 - 100] | Integer |
-
-## 🧬 Hybrid Optimization Algorithm
-
-**Three-Stage Sequential Pipeline:**
-
-1. **Stage 1 - GWO (Grey Wolf Optimizer)**
-   - Global exploration phase
-   - Identifies promising regions in search space
-   - Default: 10 iterations
-
-2. **Stage 2 - WOA (Whale Optimization Algorithm)**
-   - Local exploitation phase
-   - Refines solutions from GWO
-   - Default: 10 iterations
-
-3. **Stage 3 - AOA (Artificial Orca Algorithm)**
-   - Fine-tuning phase
-   - Precision enhancement
-   - Default: 10 iterations
-
-Each sub-algorithm receives the best solution from the previous stage as initial population.
-
-## 📊 Model Evaluation
-
-**Metrics Computed:**
-- Accuracy
-- Sensitivity (Recall)
-- Specificity
-- Precision
-- F1-Score
-- ROC-AUC
-- Matthews Correlation Coefficient (MCC)
-
-**Visualizations Generated:**
-- Confusion Matrices (Hybrid vs Baseline)
-- ROC Curves
-- Convergence Curves (per algorithm stage)
-- Performance Comparison Bar Charts
-
-## 🧪 Running Tests
-
-Run the test suite:
-
-```bash
-pytest tests/
+```powershell
+py -3.11 -m venv venv311 --clear
+.\venv311\Scripts\Activate.ps1
+pip install -r requirements.txt --default-timeout=1000
 ```
 
-Individual test files:
-- `tests/test_preprocess.py` - Data preprocessing tests
-- `tests/test_cnn_model.py` - CNN model architecture tests
-- `tests/test_optimizers.py` - Optimizer logic tests
+### Process terminates after several hours
 
-## 📓 Jupyter Notebooks
+The old workflow ran all optimisers, SHAP, and SMOTE in one script (~1,500+ CNN trainings). Use **staged commands** instead:
 
-Explore the analysis through notebooks:
-
-1. **01_eda.ipynb** - Exploratory Data Analysis
-   - Dataset statistics
-   - Feature distributions
-   - Class imbalance analysis
-   - Correlation analysis
-
-2. **02_baseline.ipynb** - Baseline Model Experiments
-   - NO-CNN baseline training
-   - Initial model comparison
-
-3. **03_results_analysis.ipynb** - Results Visualization
-   - Detailed metric analysis
-   - Convergence behavior
-   - Hyperparameter insights
-
-## 📦 Dependencies
-
-Key libraries used:
-
-```
-tensorflow==2.13.0      # Deep learning framework
-scikit-learn>=1.3       # Machine learning utilities
-numpy>=1.23,<2.0        # Numerical computing
-pandas>=1.5             # Data manipulation
-matplotlib>=3.6         # Plotting
-seaborn>=0.12           # Statistical visualization
-shap>=0.41              # Model explainability
-imbalanced-learn>=0.10  # SMOTE for class imbalance
-joblib>=1.2             # Parallel computing
-scipy>=1.9              # Scientific computing
+```powershell
+python main.py run hybrid --preset paper --evaluate   # first
+python main.py shap --run-id latest                   # then separately
 ```
 
-See [requirements.txt](requirements.txt) for the complete list.
+See `docs/Runtime_Analysis_Report.docx` for details.
 
-## 💡 Key Results
+### Out of memory during SHAP
 
-The hybrid optimizer significantly improves upon the NO-CNN baseline:
+Reduce samples in `config.yaml`:
 
-- **Hybrid Model**: ~94-96% accuracy
-- **Baseline Model**: ~85-88% accuracy
-- **Convergence**: Demonstrated improvement across GWO → WOA → AOA stages
+```yaml
+shap:
+  n_background: 20
+  n_explain: 50
+```
 
-Results are saved in:
-- `outputs/results/metrics_comparison.csv`
-- `outputs/results/hyperparameters.csv`
+### Pip download timeout
 
-## 🔍 Project Highlights
+```powershell
+pip install -r requirements.txt --default-timeout=1000
+```
 
-- **Meta-heuristic Optimization**: Combines three nature-inspired algorithms
-- **Automated Hyperparameter Tuning**: Eliminates manual grid/random search
-- **Comprehensive Evaluation**: Multiple metrics and visualizations
-- **Reproducibility**: Fixed random seeds and saved models
-- **Interpretability**: SHAP for feature importance analysis
+### Checking run progress
 
-## 📝 Notes
+Tail the log file:
 
-- The quick test uses small population/iteration counts for fast execution (~5-10 min)
-- Full optimization with production parameters may take 2-4 hours
-- Ensure GPU support for TensorFlow to speed up training
-- Results vary slightly between runs due to stochastic optimization algorithms
+```powershell
+Get-Content outputs\logs\<run_id>.log -Wait -Tail 30
+```
 
-## 👨‍💻 Author
+Or inspect `outputs/runs/<run_id>/manifest.json` for completed stages.
 
-Final Year Project - Heart Disease Prediction System
+---
 
-## 📄 License
+## License
 
-This project is provided as-is for academic purposes.
-
-## 🤝 Contributing
-
-For improvements or bug fixes:
-1. Create a feature branch
-2. Make your changes
-3. Ensure tests pass
-4. Submit a pull request
-
-## 📧 Support
-
-For questions or issues, please create an issue in the repository.
+This project is provided for academic purposes as part of a final-year research project.

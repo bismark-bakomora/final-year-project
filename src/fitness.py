@@ -1,9 +1,11 @@
+import logging
+
 import numpy as np
-import tensorflow as tf
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from src.cnn_model import build_cnn, train_cnn, decode_hyperparameters
+from src.memory_utils import aggressive_memory_cleanup, reset_fitness_gc_counter
+
+logger = logging.getLogger("heart_disease.fitness")
 
 # ─────────────────────────────────────────
 # FITNESS FUNCTION
@@ -25,6 +27,14 @@ _y_val   = None
 
 # Track evaluations for convergence plotting
 fitness_history = []
+_eval_count = 0
+_log_interval = 25
+
+
+def configure_fitness_logging(log_interval: int = 25) -> None:
+    """Set how often to log fitness evaluation progress."""
+    global _log_interval
+    _log_interval = max(1, int(log_interval))
 
 
 def set_data(X_train, y_train, X_val, y_val):
@@ -65,7 +75,7 @@ def fitness_function(x):
         Lower is better.
         0 = perfect classifier.
     """
-    global fitness_history
+    global fitness_history, _eval_count
 
     if _X_train is None:
         raise RuntimeError(
@@ -102,25 +112,35 @@ def fitness_function(x):
 
         # Track history for convergence plot (Figure 8)
         fitness_history.append(fitness)
+        _eval_count += 1
+        if _eval_count % _log_interval == 0:
+            logger.info(
+                "Fitness eval #%d | latest=%.4f acc=%.2f%% | history_len=%d",
+                _eval_count,
+                fitness,
+                (1 - fitness) * 100,
+                len(fitness_history),
+            )
 
-        # Clean up model to free memory
-        tf.keras.backend.clear_session()
         del model
+        aggressive_memory_cleanup(label="fitness_ok")
 
         return float(fitness)
 
     except Exception as e:
-        # If model fails to build/train with these
-        # hyperparameters, return worst possible fitness
-        print(f"  Fitness evaluation failed: {e}")
+        logger.warning("Fitness evaluation failed: %s", e)
         fitness_history.append(1.0)
+        _eval_count += 1
+        aggressive_memory_cleanup(label="fitness_fail")
         return 1.0
 
 
 def reset_history():
     """Reset fitness history between optimizer runs."""
-    global fitness_history
+    global fitness_history, _eval_count
     fitness_history = []
+    _eval_count = 0
+    reset_fitness_gc_counter()
 
 
 def get_history():

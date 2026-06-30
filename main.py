@@ -1,254 +1,231 @@
+"""
+Heart Disease Prediction — CLI entry point.
+
+Paper-aligned, resource-safe pipeline. Run one experiment at a time;
+artifacts and logs are persisted under outputs/.
+
+Examples:
+  python main.py preprocess
+  python main.py run hybrid --evaluate            # ~35 min (paper preset default)
+  python main.py run compare --evaluate           # Table 7, staged (~2.5 h)
+  python main.py run standalone gwo --evaluate
+  python main.py run compare --preset quick --evaluate
+  python main.py evaluate --run-id latest
+  python main.py shap --run-id latest
+  python main.py smote --run-id latest
+"""
+
+from __future__ import annotations
+
+import argparse
 import sys
 import io
-sys.stdout = io.TextIOWrapper(
-    sys.stdout.buffer, encoding='utf-8', errors='replace'
-)
-sys.stderr = io.TextIOWrapper(
-    sys.stderr.buffer, encoding='utf-8', errors='replace'
-)
-import numpy as np
-from src.preprocess import run_preprocessing
-from src.hybrid_optimizer import HybridOptimizer
-from src.cnn_model import (
-    LOWER_BOUNDS, UPPER_BOUNDS,
-    build_cnn, train_cnn, decode_hyperparameters,
-    train_model_with_retries
-)
-from src.standalone_optimizers import (
-    run_standalone_gwo, run_standalone_woa,
-    run_standalone_aoa, run_standalone_rime
-)
-from src.fitness import set_data, reset_history
-from src.evaluate import run_full_evaluation
-from src.shap_analysis import run_shap_analysis
-from src.smote_analysis import run_smote_analysis
-import joblib
 
-# ─────────────────────────────────────────
-# CONFIGURATION
-# Adjust these for quick test vs full run
-# ─────────────────────────────────────────
-POPULATION_SIZE = 6  # full paper: 20
-ITERATIONS      = 3  # full paper: 10 (per algorithm)
-RUN_LABEL       = "quick run — medium population"
+# UTF-8 console on Windows
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(
+        sys.stdout.buffer, encoding="utf-8", errors="replace"
+    )
+if hasattr(sys.stderr, "buffer"):
+    sys.stderr = io.TextIOWrapper(
+        sys.stderr.buffer, encoding="utf-8", errors="replace"
+    )
 
+# Disable oneDNN before TensorFlow loads — prevents MKL OOM on long CPU runs
+from src.tf_config import configure_tensorflow_env
+
+configure_tensorflow_env()
+
+
+def _import_pipeline():
+    from src.pipeline import PipelineRunner, load_runner_for_eval
+    return PipelineRunner, load_runner_for_eval
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="GWO-WOA-AOA heart disease prediction pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+
+    # Shared flags — available after the subcommand (e.g. run compare --preset paper)
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument(
+        "--preset",
+        choices=["paper", "quick"],
+        default="paper",
+        help="paper = Section 4.2 settings; quick = smoke test (default: paper)",
+    )
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    preprocess = sub.add_parser(
+        "preprocess",
+        parents=[shared],
+        help="Prepare dataset (Section 3.1)",
+    )
+    preprocess.add_argument(
+        "--run-id",
+        default=None,
+        help="Custom run ID (default: UTC timestamp)",
+    )
+
+    run = sub.add_parser(
+        "run",
+        parents=[shared],
+        help="Train models (one mode per invocation)",
+    )
+    run.add_argument(
+        "--run-id",
+        default=None,
+        help="Custom run ID (default: UTC timestamp)",
+    )
+    run.add_argument(
+        "mode",
+        choices=["hybrid", "baseline", "standalone", "compare"],
+        help=(
+            "hybrid = GWO-WOA-AOA (~35 min); "
+            "compare = all Table 7 models sequentially; "
+            "standalone = one algorithm; "
+            "baseline = NO-CNN only"
+        ),
+    )
+    run.add_argument(
+        "--algorithm",
+        choices=["gwo", "woa", "aoa", "rime"],
+        help="Required when mode=standalone",
+    )
+    run.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="Run test-set evaluation after training",
+    )
+    run.add_argument(
+        "--force-preprocess",
+        action="store_true",
+        help="Re-run preprocessing even if data exists",
+    )
+    run.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume compare run: skip models already saved in --run-id",
+    )
+
+    ev = sub.add_parser(
+        "evaluate",
+        parents=[shared],
+        help="Evaluate saved models from a previous run",
+    )
+    ev.add_argument(
+        "--run-id",
+        default="latest",
+        help="Run ID or 'latest' (default)",
+    )
+
+    shap = sub.add_parser(
+        "shap",
+        parents=[shared],
+        help="SHAP explainability on hybrid model (Section 4.4)",
+    )
+    shap.add_argument("--run-id", default="latest")
+
+    smote = sub.add_parser(
+        "smote",
+        parents=[shared],
+        help="SMOTE augmentation study (Section 4.5)",
+    )
+    smote.add_argument("--run-id", default="latest")
+
+    return parser
+
+
+def cmd_preprocess(args: argparse.Namespace) -> int:
+    PipelineRunner, _ = _import_pipeline()
+    runner = PipelineRunner.create(
+        preset=args.preset, run_id=args.run_id, mode="preprocess"
+    )
+    runner.ensure_preprocessed(force=True)
+    runner.finish()
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    PipelineRunner, _ = _import_pipeline()
+    if args.mode == "standalone" and not args.algorithm:
+        print("error: --algorithm is required for mode=standalone", file=sys.stderr)
+        return 2
+
+    runner = PipelineRunner.create(
+        preset=args.preset,
+        run_id=args.run_id,
+        mode=args.mode,
+        resume=args.resume,
+    )
+    try:
+        runner.ensure_preprocessed(force=args.force_preprocess)
+        data = runner.load_data()
+
+        if args.mode == "hybrid":
+            runner.run_hybrid(data)
+        elif args.mode == "baseline":
+            runner.run_baseline(data)
+        elif args.mode == "standalone":
+            runner.run_standalone(data, args.algorithm)
+        elif args.mode == "compare":
+            runner.run_compare(data, resume=args.resume)
+
+        if args.evaluate or args.mode in ("hybrid", "compare"):
+            runner.evaluate_run(data)
+
+        runner.finish()
+        print(f"\nRun complete. Artifacts: {runner.run_dir}")
+        print(f"Log file: {runner.settings.logs_dir / (runner.run_id + '.log')}")
+        return 0
+    except Exception:
+        return 1
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    _, load_runner_for_eval = _import_pipeline()
+    runner, _ = load_runner_for_eval(args.preset, args.run_id)
+    data = runner.load_data()
+    runner.evaluate_run(data)
+    runner.finish()
+    return 0
+
+
+def cmd_shap(args: argparse.Namespace) -> int:
+    _, load_runner_for_eval = _import_pipeline()
+    runner, _ = load_runner_for_eval(args.preset, args.run_id)
+    data = runner.load_data()
+    runner.run_shap(data)
+    runner.finish()
+    return 0
+
+
+def cmd_smote(args: argparse.Namespace) -> int:
+    _, load_runner_for_eval = _import_pipeline()
+    runner, _ = load_runner_for_eval(args.preset, args.run_id)
+    data = runner.load_data()
+    runner.run_smote(data)
+    runner.finish()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    handlers = {
+        "preprocess": cmd_preprocess,
+        "run": cmd_run,
+        "evaluate": cmd_evaluate,
+        "shap": cmd_shap,
+        "smote": cmd_smote,
+    }
+    return handlers[args.command](args)
 
 
 if __name__ == "__main__":
-
-    print("=" * 50)
-    print("GWO-WOA-AOA Heart Disease Prediction")
-    print(RUN_LABEL)
-    print("=" * 50)
-
-    # ── Step 1: Preprocessing ──
-    run_preprocessing(
-        'data/raw/heart_statlog_cleveland_hungary_final.csv'
-    )
-
-    # ── Load processed data ──
-    X_train = np.load('data/processed/X_train.npy')
-    y_train = np.load('data/processed/y_train.npy')
-    X_val   = np.load('data/processed/X_val.npy')
-    y_val   = np.load('data/processed/y_val.npy')
-    X_test  = np.load('data/processed/X_test.npy')
-    y_test  = np.load('data/processed/y_test.npy')
-    y_test_raw = np.load('data/processed/y_test_raw.npy')
-
-    set_data(X_train, y_train, X_val, y_val)
-
-    models_dict        = {}
-    convergence_curves = {}
-    hp_dict            = {}
-
-    # =================================================
-    # MODEL 1 — NO-CNN (baseline, no optimization)
-    # =================================================
-    print("\n" + "=" * 50)
-    print("MODEL 1/6 — NO-CNN (baseline)")
-    print("=" * 50)
-    no_cnn_hp = decode_hyperparameters(
-        [1, 1, 1, 2, 0.3, 0.001, 2, 0, 50]
-    )
-    no_cnn = train_model_with_retries(
-        no_cnn_hp, X_train, y_train, X_val, y_val,
-        n_attempts=3, label="NO-CNN"
-    )
-    models_dict['NO-CNN'] = no_cnn
-
-    # =================================================
-    # MODEL 2 — GWO-CNN (standalone GWO)
-    # =================================================
-    print("\n" + "=" * 50)
-    print("MODEL 2/6 — GWO-CNN (standalone)")
-    print("=" * 50)
-    reset_history()
-    gwo_pos, gwo_fit, gwo_curve = run_standalone_gwo(
-        POPULATION_SIZE, ITERATIONS,
-        LOWER_BOUNDS, UPPER_BOUNDS, verbose=True
-    )
-    gwo_hp = decode_hyperparameters(gwo_pos)
-    gwo_model = train_model_with_retries(
-        gwo_hp, X_train, y_train, X_val, y_val,
-        n_attempts=3, label="GWO-CNN"
-    )
-    models_dict['GWO-CNN'] = gwo_model
-    convergence_curves['GWO'] = gwo_curve
-    hp_dict['GWO-CNN'] = gwo_hp
-
-    # =================================================
-    # MODEL 3 — WOA-CNN (standalone WOA)
-    # =================================================
-    print("\n" + "=" * 50)
-    print("MODEL 3/6 — WOA-CNN (standalone)")
-    print("=" * 50)
-    reset_history()
-    woa_pos, woa_fit, woa_curve = run_standalone_woa(
-        POPULATION_SIZE, ITERATIONS,
-        LOWER_BOUNDS, UPPER_BOUNDS, verbose=True
-    )
-    woa_hp = decode_hyperparameters(woa_pos)
-    woa_model = train_model_with_retries(
-        woa_hp, X_train, y_train, X_val, y_val,
-        n_attempts=3, label="WOA-CNN"
-    )
-    models_dict['WOA-CNN'] = woa_model
-    convergence_curves['WOA'] = woa_curve
-    hp_dict['WOA-CNN'] = woa_hp
-
-    # =================================================
-    # MODEL 4 — AOA-CNN (standalone AOA)
-    # =================================================
-    print("\n" + "=" * 50)
-    print("MODEL 4/6 — AOA-CNN (standalone)")
-    print("=" * 50)
-    reset_history()
-    aoa_pos, aoa_fit, aoa_curve = run_standalone_aoa(
-        POPULATION_SIZE, ITERATIONS,
-        LOWER_BOUNDS, UPPER_BOUNDS, verbose=True
-    )
-    aoa_hp = decode_hyperparameters(aoa_pos)
-    aoa_model = train_model_with_retries(
-        aoa_hp, X_train, y_train, X_val, y_val,
-        n_attempts=3, label="AOA-CNN"
-    )
-    models_dict['AOA-CNN'] = aoa_model
-    convergence_curves['AOA'] = aoa_curve
-    hp_dict['AOA-CNN'] = aoa_hp
-
-    # =================================================
-    # MODEL 5 — RIME-CNN (standalone RIME)
-    # =================================================
-    print("\n" + "=" * 50)
-    print("MODEL 5/6 — RIME-CNN (standalone)")
-    print("=" * 50)
-    reset_history()
-    rime_pos, rime_fit, rime_curve = run_standalone_rime(
-        POPULATION_SIZE, ITERATIONS,
-        LOWER_BOUNDS, UPPER_BOUNDS, verbose=True
-    )
-    rime_hp = decode_hyperparameters(rime_pos)
-    rime_model = train_model_with_retries(
-        rime_hp, X_train, y_train, X_val, y_val,
-        n_attempts=3, label="RIME-CNN"
-    )
-    models_dict['RIME-CNN'] = rime_model
-    convergence_curves['RIME'] = rime_curve
-    hp_dict['RIME-CNN'] = rime_hp
-
-    # =================================================
-    # MODEL 6 — GWO-WOA-AOA-CNN (the hybrid)
-    # =================================================
-    print("\n" + "=" * 50)
-    print("MODEL 6/6 — GWO-WOA-AOA-CNN (hybrid)")
-    print("=" * 50)
-    hybrid = HybridOptimizer(
-        population_size=POPULATION_SIZE,
-        gwo_iterations=ITERATIONS,
-        woa_iterations=ITERATIONS,
-        aoa_iterations=ITERATIONS,
-        lower_bounds=LOWER_BOUNDS,
-        upper_bounds=UPPER_BOUNDS
-    )
-    best_hp, best_fitness, hybrid_curve = hybrid.optimize(
-        X_train, y_train, X_val, y_val, verbose=True
-    )
-    final_model = hybrid.train_final_model(
-        X_train, y_train, X_val, y_val, verbose=True
-    )
-    models_dict['GWO-WOA-AOA-CNN'] = final_model
-    convergence_curves['GWO-WOA-AOA'] = hybrid_curve
-    hp_dict['GWO-WOA-AOA-CNN'] = best_hp
-
-    # =================================================
-    # EVALUATION — Table 7, Figures 8, 9, 10
-    # =================================================
-    # Reorder to match paper Table 7 order
-    ordered_models = {
-        'NO-CNN':          models_dict['NO-CNN'],
-        'RIME-CNN':        models_dict['RIME-CNN'],
-        'AOA-CNN':         models_dict['AOA-CNN'],
-        'WOA-CNN':         models_dict['WOA-CNN'],
-        'GWO-CNN':         models_dict['GWO-CNN'],
-        'GWO-WOA-AOA-CNN': models_dict['GWO-WOA-AOA-CNN'],
-    }
-
-    results = run_full_evaluation(
-        models_dict=ordered_models,
-        X_test=X_test,
-        y_test_cat=y_test,
-        y_test_raw=y_test_raw,
-        convergence_curves=convergence_curves,
-        hp_dict=hp_dict
-    )
-
-    # =================================================
-    # SHAP EXPLAINABILITY ANALYSIS
-    # Paper Section 4.4 — Figures 14 and 15
-    # =================================================
-    print("\n" + "=" * 50)
-    print("SHAP ANALYSIS")
-    print("=" * 50)
-
-    if final_model is not None:
-        shap_values, mean_shap = run_shap_analysis(
-            model=final_model,
-            X_train=X_train,
-            X_test=X_test,
-            n_background=100,  # increase for accuracy
-            n_explain=200       # explain all test samples
-        )
-    else:
-        print("No final model available for SHAP analysis.")
-
-    # =================================================
-    # SMOTE AUGMENTATION ANALYSIS
-    # Paper Section 4.5 — Table 10 and Figure 16
-    # =================================================
-    print("\n" + "=" * 50)
-    print("SMOTE AUGMENTATION ANALYSIS")
-    print("=" * 50)
-
-    # Load scaler fitted during preprocessing
-    scaler = joblib.load('models/scaler.pkl')
-
-    # Load raw integer labels for SMOTE
-    y_train_raw = np.load('data/processed/y_train_raw.npy')
-    y_val_raw   = np.load('data/processed/y_val_raw.npy')
-    y_test_raw  = np.load('data/processed/y_test_raw.npy')
-
-    smote_results = run_smote_analysis(
-        best_hyperparams=best_hp,
-        X_train_raw=X_train,
-        y_train_raw=y_train_raw,
-        X_val_raw=X_val,
-        y_val_raw=y_val_raw,
-        X_test_raw=X_test,
-        y_test_raw=y_test_raw,
-        scaler=scaler,
-        framingham_path=None,  
-        n_attempts=5
-    )
-
-    print("\nFull comparison complete.")
-    print("Check outputs/ folder for all figures and results.")
+    raise SystemExit(main())
