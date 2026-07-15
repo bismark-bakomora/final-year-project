@@ -67,3 +67,19 @@ def configure_tensorflow_runtime(
         intra_op_threads,
         inter_op_threads,
     )
+
+
+def set_random_seeds(seed: int) -> None:
+    """Fix NumPy, Python, and TensorFlow RNG for reproducible training."""
+    import random
+
+    import numpy as np
+
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import tensorflow as tf
+
+        tf.random.set_seed(seed)
+    except ImportError:
+        pass

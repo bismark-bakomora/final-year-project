@@ -57,3 +57,9 @@ venv/
 venv311/
 .venv/
 env/
+
+# Local documentation (reports, speaker notes, generated Word/PDF)
+docs/
+
+# Local utility scripts (report generators, etc.)
+scripts/

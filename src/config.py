@@ -24,6 +24,14 @@ class RunSettings:
     train_attempts_final: int
     train_attempts_standalone: int
     early_stopping_patience: int
+    random_seed: int
+    search_seeds: tuple[int, ...]
+    cv_folds: int
+    ensemble_top_k: int
+    persist_search_checkpoints: bool
+    smote_mode: str
+    validation_gap_penalty: float
+    reuse_search_best_model: bool
     raw_data: Path
     processed_dir: Path
     models_dir: Path
@@ -59,8 +67,21 @@ def load_settings(preset: str = "paper") -> RunSettings:
     smote = cfg.get("smote", {})
     logging_cfg = cfg.get("logging", {})
     memory = cfg.get("memory", {})
+    training = cfg.get("training", {})
 
     root = PROJECT_ROOT
+    search_seeds = tuple(int(s) for s in training.get("search_seeds", [42]))
+    cv_folds = int(training.get("cv_folds", 0))
+    ensemble_top_k = int(training.get("ensemble_top_k", 3))
+    smote_mode = str(training.get("smote_mode", "none"))
+
+    # Faster iteration when using the quick preset
+    if preset == "quick":
+        search_seeds = (42,)
+        cv_folds = 0
+        ensemble_top_k = 2
+        smote_mode = "balanced"
+
     return RunSettings(
         preset=preset,
         population_size=int(preset_cfg["population_size"]),
@@ -71,6 +92,20 @@ def load_settings(preset: str = "paper") -> RunSettings:
         train_attempts_final=int(preset_cfg["train_attempts_final"]),
         train_attempts_standalone=int(preset_cfg["train_attempts_standalone"]),
         early_stopping_patience=int(preset_cfg["early_stopping_patience"]),
+        random_seed=int(training.get("random_seed", 42)),
+        search_seeds=search_seeds,
+        cv_folds=cv_folds,
+        ensemble_top_k=ensemble_top_k,
+        persist_search_checkpoints=bool(
+            training.get("persist_search_checkpoints", True)
+        ),
+        smote_mode=smote_mode,
+        validation_gap_penalty=float(
+            training.get("validation_gap_penalty", 0.0)
+        ),
+        reuse_search_best_model=bool(
+            training.get("reuse_search_best_model", True)
+        ),
         raw_data=root / paths["raw_data"],
         processed_dir=root / paths["processed_dir"],
         models_dir=root / paths["models_dir"],

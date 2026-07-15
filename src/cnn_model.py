@@ -7,7 +7,7 @@ from tensorflow.keras.layers import (
     Dense, Flatten
 )
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-import os
+from src.tf_config import set_random_seeds
 
 # ─────────────────────────────────────────
 # HYPERPARAMETER SEARCH SPACE
@@ -218,25 +218,27 @@ def build_cnn(hyperparams):
 # ─────────────────────────────────────────
 def train_cnn(model, X_train, y_train, X_val, y_val,
               batch_size, max_epoch,
-              save_path='models/best_model.weights.h5'):
+              save_path='models/best_model.weights.h5',
+              patience=5,
+              seed=None):
     """
     Train the CNN model with early stopping.
     Paper Section 3.3.1:
     'Early stopping terminates training if there is
     no improvement in validation loss over 5 epochs.'
     """
+    if seed is not None:
+        set_random_seeds(seed)
+
     os.makedirs('models', exist_ok=True)
 
     callbacks = [
-        # Early stopping — paper specifies patience=5
         EarlyStopping(
             monitor='val_loss',
-            patience=5,
+            patience=patience,
             restore_best_weights=True,
             verbose=0
         )
-        # Removed ModelCheckpoint — causes format conflicts
-        # Best weights restored via EarlyStopping instead
     ]
 
     history = model.fit(
@@ -315,7 +317,9 @@ def train_model_with_retries(hyperparams,
                               X_val, y_val,
                               n_attempts=5,
                               verbose=True,
-                              label=""):
+                              label="",
+                              patience=5,
+                              base_seed=42):
     """
     Train a CNN with given hyperparameters,
     retrying multiple times and keeping the
@@ -350,6 +354,7 @@ def train_model_with_retries(hyperparams,
             print(f"\n  Attempt {attempt}/{n_attempts}...")
 
         try:
+            attempt_seed = base_seed + attempt - 1
             model = build_cnn(hyperparams)
             train_cnn(
                 model=model,
@@ -357,6 +362,8 @@ def train_model_with_retries(hyperparams,
                 X_val=X_val, y_val=y_val,
                 batch_size=hyperparams['batch_size'],
                 max_epoch=hyperparams['max_epoch'],
+                patience=patience,
+                seed=attempt_seed,
             )
 
             _, val_acc = model.evaluate(
@@ -403,6 +410,8 @@ def train_model_with_retries(hyperparams,
                     X_val=X_val, y_val=y_val,
                     batch_size=fallback_hp['batch_size'],
                     max_epoch=fallback_hp['max_epoch'],
+                    patience=patience,
+                    seed=base_seed + 100 + attempt,
                 )
                 _, val_acc = model.evaluate(
                     X_val, y_val, verbose=0
@@ -423,6 +432,14 @@ def train_model_with_retries(hyperparams,
               f"{best_val_acc*100:.2f}%")
 
     return best_model
+
+
+def load_model_from_checkpoint(hyperparams: dict, weights_path: str):
+    """Rebuild architecture and load saved search/final weights."""
+    model = build_cnn(hyperparams)
+    model.load_weights(weights_path)
+    return model
+
 
 if __name__ == "__main__":
     test_cnn_build()

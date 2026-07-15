@@ -20,13 +20,15 @@ This repository is structured as an **industry-style ML pipeline**: staged CLI c
 6. [Quick start](#quick-start)
 7. [CLI reference](#cli-reference)
 8. [Configuration](#configuration)
-9. [Pipeline stages explained](#pipeline-stages-explained)
-10. [Outputs and artifacts](#outputs-and-artifacts)
-11. [Expected runtimes](#expected-runtimes)
-12. [Project structure](#project-structure)
-13. [Reproducing paper results](#reproducing-paper-results)
-14. [Troubleshooting](#troubleshooting)
-15. [References](#references)
+9. [Configuration](#configuration)
+10. [Pipeline improvements (97%+ target)](#pipeline-improvements-97-target)
+11. [Pipeline stages explained](#pipeline-stages-explained)
+12. [Outputs and artifacts](#outputs-and-artifacts)
+13. [Expected runtimes](#expected-runtimes)
+14. [Project structure](#project-structure)
+15. [Reproducing paper results](#reproducing-paper-results)
+16. [Troubleshooting](#troubleshooting)
+17. [References](#references)
 
 ---
 
@@ -42,7 +44,7 @@ This repository is structured as an **industry-style ML pipeline**: staged CLI c
 
 **Important design choice:** The reference paper reports ~25–36 minutes **per individual optimizer run**. This project runs **one experiment per CLI command**, saves models to disk, and frees memory between stages. That matches the paper’s methodology and avoids the multi-hour, out-of-memory failures caused by running everything in a single script.
 
-For a detailed runtime analysis, see `docs/Runtime_Analysis_Report.docx`.
+For a detailed runtime analysis, see local reports under `docs/` (gitignored).
 
 ---
 
@@ -294,9 +296,23 @@ Matches Section 4.2 experimental setup:
 | Population size | 20 |
 | Hybrid iterations per stage | 10 (30 total) |
 | Standalone iterations | 30 |
-| Final model training attempts | 3 |
+| Final model training attempts | 8 |
 | Standalone training attempts | 1 |
 | Early stopping patience | 5 |
+
+### Training improvements (`training` block)
+
+See **`docs/Pipeline_Improvements_Report.docx`** for full before/after documentation. Highlights:
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| `search_seeds` | `[42, 43, 44]` | Multi-seed hybrid search |
+| `cv_folds` | `5` | K-fold CV during fitness |
+| `smote_mode` | `balanced` | SMOTE train split before hybrid |
+| `persist_search_checkpoints` | `true` | Keep best validation weights during search |
+| `reuse_search_best_model` | `true` | Final model reuses search checkpoint |
+| `ensemble_top_k` | `3` | Top checkpoints for ensemble |
+| `validation_gap_penalty` | `0.15` | Penalise train–val overfitting |
 
 ### `quick` preset
 
@@ -325,6 +341,24 @@ logging:
 ```
 
 Edit `config.yaml` to tune these without changing code.
+
+---
+
+## Pipeline improvements (97%+ target)
+
+After the baseline hybrid run (`20260630_151218`, 90.34% test / 96.64% search validation), five pipeline changes were implemented to close the gap and target **96%+** (stretch **97%+**).
+
+| # | Change | Before | After |
+|---|--------|--------|-------|
+| 1 | Persist search-best model | Weights discarded each fitness eval | Checkpoints saved; final step reuses best |
+| 2 | Stabilise training | Unseeded, 3 final attempts | Seeded attempts, patience from config, 8 retries |
+| 3 | SMOTE | Post-hoc `smote` command only | `balanced` SMOTE on train before hybrid search |
+| 4 | Fitness | Single val split | 5-fold CV + train–val gap penalty |
+| 5 | Robustness | One run, one model | 3 seeds + ensemble evaluation |
+
+**Run:** `python main.py run hybrid --preset paper --evaluate`
+
+**Details:** `docs/Pipeline_Improvements_Report.docx` (regenerate: `python scripts/generate_pipeline_improvements_report.py`)
 
 ---
 
@@ -530,8 +564,8 @@ That reproduces the paper’s main hybrid result (~96% accuracy target) in ~35 m
 
 Activate the virtual environment and install dependencies:
 
-```powershell
-.\venv311\Scripts\Activate.ps1
+     ```powershell
+     .\venv311\Scripts\Activate.ps1
 pip install -r requirements.txt --default-timeout=1000
 ```
 

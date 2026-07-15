@@ -1,11 +1,22 @@
 # Pipeline configuration — matches paper Section 4.2 defaults
 # Use preset "quick" for smoke tests (~5 min)
 
+# Global training improvements (applied to hybrid search + final train)
+training:
+  random_seed: 42
+  search_seeds: [42, 43, 44]       # multi-seed hybrid runs; use [42] for single seed
+  cv_folds: 5                        # K-fold CV during fitness (0 = single val split)
+  ensemble_top_k: 3                  # keep top-K checkpoints for ensemble
+  persist_search_checkpoints: true   # save best validation weights during search
+  smote_mode: balanced               # none | balanced | double_balanced
+  validation_gap_penalty: 0.15       # penalty weight for train-val accuracy gap
+  reuse_search_best_model: true      # use persisted search model for final eval
+
 paper:
   population_size: 20
   hybrid_iterations_per_stage: 10   # GWO + WOA + AOA = 30 total (Section 3.2.4)
   standalone_iterations: 30         # Section 4.2 standalone comparison
-  train_attempts_final: 3
+  train_attempts_final: 8
   train_attempts_standalone: 1
   early_stopping_patience: 5
 
@@ -13,7 +24,7 @@ quick:
   population_size: 3
   hybrid_iterations_per_stage: 2
   standalone_iterations: 2
-  train_attempts_final: 1
+  train_attempts_final: 2
   train_attempts_standalone: 1
   early_stopping_patience: 3
 

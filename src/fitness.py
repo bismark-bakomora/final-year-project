@@ -1,130 +1,288 @@
+import json
 import logging
+import shutil
+from pathlib import Path
 
 import numpy as np
+from sklearn.model_selection import StratifiedKFold
 
-from src.cnn_model import build_cnn, train_cnn, decode_hyperparameters
+from src.cnn_model import build_cnn, decode_hyperparameters, train_cnn
 from src.memory_utils import aggressive_memory_cleanup, reset_fitness_gc_counter
+from src.tf_config import set_random_seeds
 
 logger = logging.getLogger("heart_disease.fitness")
 
 # ─────────────────────────────────────────
 # FITNESS FUNCTION
 # Paper Section 3.3.2, Equation 23:
-# f(x) = 1 - (TP + TN) / (TP + TN + FP + FN)
 # f(x) = 1 - validation_accuracy
-#
-# This is a MINIMIZATION problem:
-# - f(x) = 0   means 100% accuracy (perfect)
-# - f(x) = 1   means 0% accuracy (worst)
-# The optimizer tries to find x that minimizes f(x)
 # ─────────────────────────────────────────
 
-# Global data references — set once before optimization
 _X_train = None
 _y_train = None
-_X_val   = None
-_y_val   = None
+_X_val = None
+_y_val = None
+_y_train_raw = None
 
-# Track evaluations for convergence plotting
 fitness_history = []
 _eval_count = 0
 _log_interval = 25
 
+# Runtime configuration (set via configure_fitness)
+_cv_folds = 0
+_persist_checkpoints = True
+_gap_penalty = 0.0
+_early_stopping_patience = 5
+_ensemble_top_k = 3
+_fitness_seed = 42
+_checkpoint_dir: Path | None = None
+
+# Best search checkpoint (single best)
+_best_fitness = float("inf")
+_best_val_accuracy = 0.0
+_best_hyperparams: dict | None = None
+_best_weights_path: Path | None = None
+
+# Top-K checkpoints for ensemble [{fitness, val_accuracy, hyperparams, weights_path}]
+_top_checkpoints: list[dict] = []
+
 
 def configure_fitness_logging(log_interval: int = 25) -> None:
-    """Set how often to log fitness evaluation progress."""
     global _log_interval
     _log_interval = max(1, int(log_interval))
 
 
-def set_data(X_train, y_train, X_val, y_val):
-    """
-    Set the training and validation data globally.
-    Called once before optimization begins.
-    Only train and val data are used here —
-    test data is never touched during optimization
-    as per paper Section 3.3.3.
-    """
-    global _X_train, _y_train, _X_val, _y_val
+def configure_fitness(
+    *,
+    cv_folds: int = 0,
+    persist_checkpoints: bool = True,
+    validation_gap_penalty: float = 0.0,
+    early_stopping_patience: int = 5,
+    ensemble_top_k: int = 3,
+    checkpoint_dir: Path | str | None = None,
+    fitness_seed: int = 42,
+) -> None:
+    """Apply pipeline training settings to the fitness evaluator."""
+    global _cv_folds, _persist_checkpoints, _gap_penalty
+    global _early_stopping_patience, _ensemble_top_k, _checkpoint_dir
+    global _fitness_seed
+
+    _cv_folds = max(0, int(cv_folds))
+    _persist_checkpoints = bool(persist_checkpoints)
+    _gap_penalty = max(0.0, float(validation_gap_penalty))
+    _early_stopping_patience = max(1, int(early_stopping_patience))
+    _ensemble_top_k = max(1, int(ensemble_top_k))
+    _fitness_seed = int(fitness_seed)
+    _checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
+
+
+def set_data(X_train, y_train, X_val, y_val, y_train_raw=None):
+    """Register train/val arrays used during hyperparameter search."""
+    global _X_train, _y_train, _X_val, _y_val, _y_train_raw
     _X_train = X_train
     _y_train = y_train
-    _X_val   = X_val
-    _y_val   = y_val
+    _X_val = X_val
+    _y_val = y_val
+    if y_train_raw is None:
+        _y_train_raw = np.argmax(y_train, axis=1)
+    else:
+        _y_train_raw = y_train_raw
+
+
+def _checkpoint_root() -> Path:
+    if _checkpoint_dir is not None:
+        root = _checkpoint_dir
+    else:
+        root = Path("models") / "search_checkpoints"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _hyperparams_match(a: dict, b: dict) -> bool:
+    if a is None or b is None:
+        return False
+    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
+def _train_and_evaluate(
+    hyperparams: dict,
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    seed: int,
+) -> tuple[float, float, object]:
+    """Train one candidate and return (fitness, val_accuracy, model)."""
+    model = build_cnn(hyperparams)
+    train_cnn(
+        model=model,
+        X_train=X_train,
+        y_train=y_train,
+        X_val=X_val,
+        y_val=y_val,
+        batch_size=hyperparams["batch_size"],
+        max_epoch=hyperparams["max_epoch"],
+        patience=_early_stopping_patience,
+        seed=seed,
+    )
+    train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
+    _, val_accuracy = model.evaluate(X_val, y_val, verbose=0)
+
+    gap = max(0.0, float(train_acc) - float(val_accuracy))
+    fitness = 1.0 - float(val_accuracy) + _gap_penalty * gap
+    return fitness, float(val_accuracy), model
+
+
+def _evaluate_kfold(hyperparams: dict, seed: int) -> tuple[float, float, object]:
+    """K-fold CV on training data; last fold model returned for checkpointing."""
+    kf = StratifiedKFold(
+        n_splits=_cv_folds,
+        shuffle=True,
+        random_state=seed,
+    )
+    fold_fitness: list[float] = []
+    fold_val_acc: list[float] = []
+    last_model = None
+
+    for fold_idx, (tr_idx, va_idx) in enumerate(
+        kf.split(_X_train, _y_train_raw)
+    ):
+        X_tr = _X_train[tr_idx]
+        y_tr = _y_train[tr_idx]
+        X_va = _X_train[va_idx]
+        y_va = _y_train[va_idx]
+        fold_seed = seed + fold_idx
+        fitness, val_acc, model = _train_and_evaluate(
+            hyperparams, X_tr, y_tr, X_va, y_va, fold_seed
+        )
+        fold_fitness.append(fitness)
+        fold_val_acc.append(val_acc)
+        if last_model is not None:
+            del last_model
+        last_model = model
+
+    mean_fitness = float(np.mean(fold_fitness))
+    mean_val_acc = float(np.mean(fold_val_acc))
+    return mean_fitness, mean_val_acc, last_model
+
+
+def _save_checkpoint(
+    model, hyperparams: dict, fitness: float, val_accuracy: float
+) -> tuple[Path, Path]:
+    """Persist weights and hyperparameter metadata for a candidate model."""
+    root = _checkpoint_root()
+    tag = f"ckpt_{_eval_count:05d}_{val_accuracy:.4f}"
+    weights_path = root / f"{tag}.weights.h5"
+    hp_path = root / f"{tag}.json"
+    model.save_weights(weights_path)
+    hp_path.write_text(json.dumps(hyperparams, indent=2), encoding="utf-8")
+    return weights_path, hp_path
+
+
+def _register_checkpoint(
+    model,
+    hyperparams: dict,
+    fitness: float,
+    val_accuracy: float,
+) -> None:
+    """Track global best and top-K ensemble checkpoints."""
+    global _best_fitness, _best_val_accuracy, _best_hyperparams, _best_weights_path
+
+    weights_path, hp_path = _save_checkpoint(
+        model, hyperparams, fitness, val_accuracy
+    )
+    entry = {
+        "fitness": fitness,
+        "val_accuracy": val_accuracy,
+        "hyperparams": hyperparams.copy(),
+        "weights_path": str(weights_path),
+        "meta_path": str(hp_path),
+    }
+
+    _top_checkpoints.append(entry)
+    _top_checkpoints.sort(key=lambda e: e["fitness"])
+    while len(_top_checkpoints) > _ensemble_top_k:
+        dropped = _top_checkpoints.pop()
+        try:
+            Path(dropped["weights_path"]).unlink(missing_ok=True)
+            Path(dropped["meta_path"]).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if fitness < _best_fitness:
+        _best_fitness = fitness
+        _best_val_accuracy = val_accuracy
+        _best_hyperparams = hyperparams.copy()
+        _best_weights_path = weights_path
+
+        best_link = _checkpoint_root() / "best.weights.h5"
+        best_meta = _checkpoint_root() / "best.json"
+        shutil.copy2(weights_path, best_link)
+        best_meta.write_text(
+            json.dumps(
+                {
+                    "fitness": fitness,
+                    "val_accuracy": val_accuracy,
+                    "hyperparams": hyperparams,
+                    "weights_path": str(best_link),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        _best_weights_path = best_link
+        logger.info(
+            "New search-best checkpoint | fitness=%.4f val_acc=%.2f%%",
+            fitness,
+            val_accuracy * 100,
+        )
 
 
 def fitness_function(x):
     """
-    Evaluate a hyperparameter vector x.
-
-    Paper Equation 23:
-    f(x) = 1 - (TP + TN) / (TP + TN + FP + FN)
-         = 1 - validation_accuracy
-
-    Parameters
-    ----------
-    x : array-like, shape (9,)
-        Hyperparameter vector:
-        [filters_idx, kernel_idx, pooling_idx,
-         neurons_idx, dropout_rate, learning_rate,
-         batch_idx, optimizer_idx, max_epoch]
-
-    Returns
-    -------
-    fitness : float
-        Value between 0 and 1.
-        Lower is better.
-        0 = perfect classifier.
+    Evaluate hyperparameter vector x.
+    Returns 1 - validation_accuracy (lower is better).
     """
     global fitness_history, _eval_count
 
     if _X_train is None:
-        raise RuntimeError(
-            "Data not set. Call fitness.set_data() first."
-        )
+        raise RuntimeError("Data not set. Call fitness.set_data() first.")
 
     try:
-        # Step 1 — Decode continuous vector to hyperparameters
+        set_random_seeds(_fitness_seed + _eval_count)
         hyperparams = decode_hyperparameters(x)
 
-        # Step 2 — Build CNN with these hyperparameters
-        # Model is rebuilt from scratch each evaluation
-        model = build_cnn(hyperparams)
+        if _cv_folds >= 2:
+            fitness, val_accuracy, model = _evaluate_kfold(
+                hyperparams, _fitness_seed + _eval_count
+            )
+        else:
+            fitness, val_accuracy, model = _train_and_evaluate(
+                hyperparams,
+                _X_train,
+                _y_train,
+                _X_val,
+                _y_val,
+                _fitness_seed + _eval_count,
+            )
 
-        # Step 3 — Train on training set
-        # Validation set used for early stopping only
-        train_cnn(
-            model=model,
-            X_train=_X_train,
-            y_train=_y_train,
-            X_val=_X_val,
-            y_val=_y_val,
-            batch_size=hyperparams['batch_size'],
-            max_epoch=hyperparams['max_epoch'],
-        )
-
-        # Step 4 — Evaluate on validation set
-        _, val_accuracy = model.evaluate(
-            _X_val, _y_val, verbose=0
-        )
-
-        # Step 5 — Compute fitness (Equation 23)
-        fitness = 1.0 - val_accuracy
-
-        # Track history for convergence plot (Figure 8)
         fitness_history.append(fitness)
         _eval_count += 1
+
         if _eval_count % _log_interval == 0:
             logger.info(
                 "Fitness eval #%d | latest=%.4f acc=%.2f%% | history_len=%d",
                 _eval_count,
                 fitness,
-                (1 - fitness) * 100,
+                val_accuracy * 100,
                 len(fitness_history),
             )
 
+        if _persist_checkpoints:
+            _register_checkpoint(model, hyperparams, fitness, val_accuracy)
+
         del model
         aggressive_memory_cleanup(label="fitness_ok")
-
         return float(fitness)
 
     except Exception as e:
@@ -143,59 +301,40 @@ def reset_history():
     reset_fitness_gc_counter()
 
 
+def reset_search_checkpoints(clear_disk: bool = True) -> None:
+    """Clear in-memory and on-disk search checkpoints (e.g. new seed run)."""
+    global _best_fitness, _best_val_accuracy, _best_hyperparams
+    global _best_weights_path, _top_checkpoints
+
+    _best_fitness = float("inf")
+    _best_val_accuracy = 0.0
+    _best_hyperparams = None
+    _best_weights_path = None
+    _top_checkpoints = []
+
+    if clear_disk:
+        root = _checkpoint_root()
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+            root.mkdir(parents=True, exist_ok=True)
+
+
+def get_best_search_checkpoint() -> dict | None:
+    """Return best persisted search checkpoint metadata."""
+    if _best_weights_path is None or _best_hyperparams is None:
+        return None
+    return {
+        "fitness": _best_fitness,
+        "val_accuracy": _best_val_accuracy,
+        "hyperparams": _best_hyperparams.copy(),
+        "weights_path": str(_best_weights_path),
+    }
+
+
+def get_top_checkpoints() -> list[dict]:
+    """Return top-K checkpoint metadata sorted by fitness (best first)."""
+    return [dict(c) for c in _top_checkpoints]
+
+
 def get_history():
-    """Return fitness history for convergence plotting."""
     return fitness_history.copy()
-
-
-# ─────────────────────────────────────────
-# QUICK TEST
-# ─────────────────────────────────────────
-def test_fitness():
-    """
-    Test fitness function with paper's optimal
-    hyperparameters from Table 6.
-    Expected fitness ≈ 0.05 (95%+ accuracy)
-    """
-    import numpy as np
-
-    print("Testing fitness function...")
-    print("-" * 50)
-
-    # Load preprocessed data
-    X_train = np.load('data/processed/X_train.npy')
-    y_train = np.load('data/processed/y_train.npy')
-    X_val   = np.load('data/processed/X_val.npy')
-    y_val   = np.load('data/processed/y_val.npy')
-
-    # Register data with fitness function
-    set_data(X_train, y_train, X_val, y_val)
-
-    # Paper's optimal hyperparameter vector (Table 6)
-    # [filters_idx, kernel_idx, pooling_idx, neurons_idx,
-    #  dropout,     lr,         batch_idx,   opt_idx, epoch]
-    #
-    # filters=[32,64,128,256] → index 2
-    # kernel=11               → index 4
-    # pooling=3               → index 1
-    # neurons=128             → index 3
-    # dropout=0.313
-    # lr=0.00015
-    # batch=128               → index 5
-    # optimizer=adam          → index 0
-    # epoch=36
-    x_test = np.array([2, 4, 1, 3, 0.313, 0.00015, 5, 0, 36])
-
-    print(f"Hyperparameter vector: {x_test}")
-    print("Training CNN (this takes ~1-2 minutes)...")
-
-    fitness = fitness_function(x_test)
-
-    print(f"\nFitness value:    {fitness:.4f}")
-    print(f"Val accuracy:     {(1 - fitness) * 100:.2f}%")
-    print(f"Fitness history:  {get_history()}")
-    print("\nFitness function test PASSED")
-
-
-if __name__ == "__main__":
-    test_fitness()

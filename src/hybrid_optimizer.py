@@ -1,12 +1,19 @@
 import numpy as np
 import time
+from pathlib import Path
 from src.gwo import GWO
 from src.woa import WOA
 from src.aoa import AOA
-from src.fitness import set_data, reset_history
+from src.fitness import (
+    set_data,
+    reset_history,
+    get_best_search_checkpoint,
+    get_top_checkpoints,
+)
 from src.cnn_model import (
     LOWER_BOUNDS, UPPER_BOUNDS,
-    decode_hyperparameters, build_cnn, train_cnn
+    decode_hyperparameters, build_cnn, train_cnn,
+    train_model_with_retries, load_model_from_checkpoint,
 )
 
 # ─────────────────────────────────────────
@@ -222,24 +229,10 @@ class HybridOptimizer:
     def optimize(self,
                  X_train, y_train,
                  X_val, y_val,
-                 verbose=True):
+                 verbose=True,
+                 y_train_raw=None):
         """
         Run full GWO-WOA-AOA hybrid optimization.
-
-        Parameters
-        ----------
-        X_train, y_train : training data
-        X_val, y_val     : validation data
-        verbose          : print progress
-
-        Returns
-        -------
-        best_hyperparams : dict
-            Final decoded hyperparameters.
-        best_fitness : float
-            Final best fitness value.
-        convergence_curve : list
-            Combined curve across all 3 stages.
         """
         self.start_time = time.time()
 
@@ -254,9 +247,7 @@ class HybridOptimizer:
             print(f"Total iterations: {total_iter}")
             print(f"Population size: {self.population_size}")
 
-        # Register data with fitness function
-        # Test data is never used here
-        set_data(X_train, y_train, X_val, y_val)
+        set_data(X_train, y_train, X_val, y_val, y_train_raw)
         reset_history()
 
         # ── Stage 1: GWO Exploration ──
@@ -325,140 +316,72 @@ class HybridOptimizer:
                       X_train, y_train,
                       X_val, y_val,
                       verbose=True,
-                      n_attempts=5):
+                      n_attempts=5,
+                      patience=5,
+                      base_seed=42,
+                      reuse_search_best=True):
         """
-        Train final CNN with optimal hyperparameters.
-        Runs multiple attempts and picks the best
-        to handle random weight initialisation variance
-        and SGD instability (paper uses Adam as default).
+        Return final CNN — reuse best search checkpoint when available,
+        otherwise train with multiple seeded attempts.
         """
         if self.best_hyperparams is None:
-            raise RuntimeError(
-                "Run optimize() first."
-            )
+            raise RuntimeError("Run optimize() first.")
 
-        if verbose:
-            print("\nTraining final CNN model...")
-            print(f"Hyperparameters: {self.best_hyperparams}")
-            print(f"Running {n_attempts} attempts "
-                f"to handle initialisation variance...")
-
-        best_model    = None
-        best_val_acc  = 0.0
-
-        for attempt in range(1, n_attempts + 1):
-            if verbose:
-                print(f"\n  Attempt {attempt}/{n_attempts}...")
-
-            try:
-                model = build_cnn(self.best_hyperparams)
-
-                train_cnn(
-                    model=model,
-                    X_train=X_train,
-                    y_train=y_train,
-                    X_val=X_val,
-                    y_val=y_val,
-                    batch_size=self.best_hyperparams[
-                        'batch_size'],
-                    max_epoch=self.best_hyperparams[
-                        'max_epoch'],
-                )
-
-                # Evaluate on validation set
-                _, val_acc = model.evaluate(
-                    X_val, y_val, verbose=0
-                )
-
-                # Check model predicts both classes
-                # A collapsed model predicts only one class
-                y_prob = model.predict(X_val, verbose=0)
-                y_pred = np.argmax(y_prob, axis=1)
-                unique_classes = len(np.unique(y_pred))
-
-                if verbose:
-                    print(f"  Val accuracy:          "
-                        f"{val_acc*100:.2f}%")
-                    print(f"  Classes predicted:     "
-                        f"{unique_classes}/2")
-
-                # Only accept if predicting both classes
-                if unique_classes >= 2 and \
-                        val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    best_model   = model
-                    if verbose:
-                        print(f"  ✓ New best model.")
-                else:
-                    if verbose:
-                        print(f"  ✗ Model collapsed "
-                            f"or worse — skipping.")
-
-            except Exception as e:
-                if verbose:
-                    print(f"  Attempt {attempt} failed: {e}")
-
-        # If all attempts collapsed fall back to Adam
-        # SGD can be unstable with certain learning rates
-        if best_model is None:
-            if verbose:
-                print(f"\n  All {n_attempts} attempts "
-                    f"collapsed.")
-                print(f"  Falling back to Adam optimizer "
-                    f"for stability...")
-
-            fallback_hp = self.best_hyperparams.copy()
-            fallback_hp['optimizer']     = 'adam'
-            fallback_hp['learning_rate'] = 0.001
-
-            for attempt in range(1, 4):
-                if verbose:
-                    print(f"\n  Fallback attempt "
-                        f"{attempt}/3...")
-                try:
-                    model = build_cnn(fallback_hp)
-                    train_cnn(
-                        model=model,
-                        X_train=X_train,
-                        y_train=y_train,
-                        X_val=X_val,
-                        y_val=y_val,
-                        batch_size=fallback_hp['batch_size'],
-                        max_epoch=fallback_hp['max_epoch'],
-                    )
-                    _, val_acc = model.evaluate(
-                        X_val, y_val, verbose=0
-                    )
-                    y_pred = np.argmax(
-                        model.predict(X_val, verbose=0),
-                        axis=1
-                    )
-                    unique_classes = len(np.unique(y_pred))
-
-                    if verbose:
-                        print(f"  Val accuracy:      "
-                            f"{val_acc*100:.2f}%")
-                        print(f"  Classes predicted: "
-                            f"{unique_classes}/2")
-
-                    if unique_classes >= 2 and \
-                            val_acc > best_val_acc:
-                        best_val_acc = val_acc
-                        best_model   = model
+        if reuse_search_best:
+            checkpoint = get_best_search_checkpoint()
+            if checkpoint and checkpoint.get("hyperparams"):
+                hp = checkpoint["hyperparams"]
+                weights = checkpoint.get("weights_path")
+                if weights and Path(weights).exists():
+                    try:
                         if verbose:
-                            print(f"  ✓ Fallback model accepted.")
-
-                except Exception as e:
-                    if verbose:
-                        print(f"  Fallback attempt "
-                            f"{attempt} failed: {e}")
+                            print("\nReusing best validation model from search...")
+                            print(
+                                f"  Search val accuracy: "
+                                f"{checkpoint['val_accuracy']*100:.2f}%"
+                            )
+                        model = load_model_from_checkpoint(hp, weights)
+                        _, val_acc = model.evaluate(
+                            X_val, y_val, verbose=0
+                        )
+                        y_pred = np.argmax(
+                            model.predict(X_val, verbose=0), axis=1
+                        )
+                        if len(np.unique(y_pred)) >= 2:
+                            if verbose:
+                                print(
+                                    f"  Reused model val accuracy: "
+                                    f"{val_acc*100:.2f}%"
+                                )
+                            self.best_hyperparams = hp
+                            return model
+                        if verbose:
+                            print("  Reused model collapsed — retraining.")
+                    except Exception as exc:
+                        if verbose:
+                            print(f"  Could not load search checkpoint: {exc}")
 
         if verbose:
-            print(f"\nFinal model training complete.")
-            print(f"Best validation accuracy: "
-                f"{best_val_acc*100:.2f}%")
+            print("\nTraining final CNN model (seeded retries)...")
+            print(f"Hyperparameters: {self.best_hyperparams}")
+            print(f"Running {n_attempts} attempts...")
 
-        return best_model
+        return train_model_with_retries(
+            self.best_hyperparams,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            n_attempts=n_attempts,
+            verbose=verbose,
+            label="GWO-WOA-AOA-CNN",
+            patience=patience,
+            base_seed=base_seed,
+        )
+
+    def get_ensemble_checkpoints(self) -> list[dict]:
+        """Top-K search checkpoints for ensemble evaluation."""
+        return get_top_checkpoints()
 
 
 # ─────────────────────────────────────────

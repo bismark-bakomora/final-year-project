@@ -21,6 +21,7 @@ import numpy as np
 from src.artifacts import (
     finalize_run,
     init_run,
+    load_ensemble_models,
     load_keras_model,
     list_saved_models,
     model_artifact_exists,
@@ -29,8 +30,10 @@ from src.artifacts import (
     register_artifact,
     resolve_run_dir,
     save_convergence,
+    save_ensemble_models,
     save_hyperparameters,
     save_keras_model,
+    ensemble_manifest_exists,
 )
 from src.cnn_model import (
     LOWER_BOUNDS,
@@ -39,21 +42,31 @@ from src.cnn_model import (
     train_model_with_retries,
 )
 from src.config import RunSettings, load_settings
-from src.evaluate import run_full_evaluation
-from src.fitness import configure_fitness_logging, reset_history, set_data
+from src.evaluate import run_full_evaluation, evaluate_ensemble, evaluate_model
+from src.fitness import (
+    configure_fitness,
+    configure_fitness_logging,
+    reset_history,
+    reset_search_checkpoints,
+    set_data,
+)
 from src.hybrid_optimizer import HybridOptimizer
 from src.logging_config import get_stage_logger, setup_logging
 from src.memory_utils import cleanup_after_stage, release_model
 from src.preprocess import run_preprocessing
 from src.shap_analysis import run_shap_analysis
-from src.smote_analysis import run_smote_analysis
+from src.smote_analysis import (
+    prepare_balanced,
+    prepare_double_balanced,
+    run_smote_analysis,
+)
 from src.standalone_optimizers import (
     run_standalone_aoa,
     run_standalone_gwo,
     run_standalone_rime,
     run_standalone_woa,
 )
-from src.tf_config import configure_tensorflow_runtime
+from src.tf_config import configure_tensorflow_runtime, set_random_seeds
 
 STANDALONE_ALGOS = {
     "gwo": ("GWO-CNN", run_standalone_gwo, "GWO"),
@@ -126,6 +139,7 @@ class PipelineRunner:
             log = get_stage_logger("runner")
             configure_fitness_logging(settings.fitness_eval_log_interval)
             configure_tensorflow_runtime()
+            set_random_seeds(settings.random_seed)
             log.info(
                 "Resuming pipeline | preset=%s mode=%s run_id=%s",
                 preset,
@@ -142,6 +156,7 @@ class PipelineRunner:
         run_dir = init_run(settings.runs_dir, rid, preset, mode)
         configure_fitness_logging(settings.fitness_eval_log_interval)
         configure_tensorflow_runtime()
+        set_random_seeds(settings.random_seed)
         log.info(
             "Pipeline started | preset=%s mode=%s run_id=%s",
             preset,
@@ -178,8 +193,68 @@ class PipelineRunner:
             y_val_raw=np.load(p / "y_val_raw.npy"),
         )
 
-    def _bind_fitness_data(self, data: DatasetBundle) -> None:
-        set_data(data.X_train, data.y_train, data.X_val, data.y_val)
+    def _bind_fitness_data(
+        self,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        y_train_raw=None,
+    ) -> None:
+        set_data(X_train, y_train, X_val, y_val, y_train_raw)
+
+    def _configure_fitness_runtime(self, seed: int, model_key: str) -> None:
+        ckpt_dir = self.run_dir / model_key / f"search_checkpoints_seed{seed}"
+        configure_fitness(
+            cv_folds=self.settings.cv_folds,
+            persist_checkpoints=self.settings.persist_search_checkpoints,
+            validation_gap_penalty=self.settings.validation_gap_penalty,
+            early_stopping_patience=self.settings.early_stopping_patience,
+            ensemble_top_k=self.settings.ensemble_top_k,
+            checkpoint_dir=ckpt_dir,
+            fitness_seed=seed,
+        )
+
+    def _prepare_hybrid_training_data(
+        self, data: DatasetBundle
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Optionally apply SMOTE to training split only (paper Section 4.5)."""
+        mode = self.settings.smote_mode.lower()
+        if mode in ("none", ""):
+            self.log.info("Hybrid training data: original (no SMOTE)")
+            y_raw = np.argmax(data.y_train, axis=1)
+            return data.X_train, data.y_train, y_raw
+
+        scaler = joblib.load(self.settings.models_dir / "scaler.pkl")
+        self.log.info("Hybrid training data: SMOTE mode=%s", mode)
+
+        if mode == "balanced":
+            X_tr, y_tr, _, _, _, _, _ = prepare_balanced(
+                data.X_train,
+                data.y_train_raw,
+                data.X_val,
+                data.y_val_raw,
+                data.X_test,
+                data.y_test_raw,
+                scaler,
+            )
+        elif mode == "double_balanced":
+            X_tr, y_tr, _, _, _, _, _ = prepare_double_balanced(
+                data.X_train,
+                data.y_train_raw,
+                data.X_val,
+                data.y_val_raw,
+                data.X_test,
+                data.y_test_raw,
+                scaler,
+            )
+        else:
+            raise ValueError(
+                f"Unknown smote_mode '{mode}'. Use: none, balanced, double_balanced"
+            )
+
+        y_raw = np.argmax(y_tr, axis=1)
+        return X_tr, y_tr, y_raw
 
     # ── training stages ─────────────────────────────────────
 
@@ -199,6 +274,8 @@ class PipelineRunner:
                 n_attempts=self.settings.train_attempts_standalone,
                 verbose=True,
                 label=key,
+                patience=self.settings.early_stopping_patience,
+                base_seed=self.settings.random_seed,
             )
             self._persist_model(key, model, hp, curve=None)
             release_model(model, label=key)
@@ -214,8 +291,16 @@ class PipelineRunner:
             )
         model_key, runner, curve_key = STANDALONE_ALGOS[algo]
         with self._stage(model_key):
-            self._bind_fitness_data(data)
+            self._configure_fitness_runtime(self.settings.random_seed, model_key)
+            self._bind_fitness_data(
+                data.X_train,
+                data.y_train,
+                data.X_val,
+                data.y_val,
+                data.y_train_raw,
+            )
             reset_history()
+            reset_search_checkpoints(clear_disk=True)
             self.log.info(
                 "Optimising %s | pop=%d iter=%d",
                 model_key,
@@ -245,6 +330,8 @@ class PipelineRunner:
                 n_attempts=self.settings.train_attempts_standalone,
                 verbose=True,
                 label=model_key,
+                patience=self.settings.early_stopping_patience,
+                base_seed=self.settings.random_seed,
             )
             self._persist_model(model_key, model, hp, curve, curve_key)
             release_model(model, label=model_key)
@@ -252,50 +339,147 @@ class PipelineRunner:
         return model_key
 
     def run_hybrid(self, data: DatasetBundle) -> str:
-        """GWO→WOA→AOA hybrid — paper Section 3.2.4 (~35 min on paper hardware)."""
+        """GWO→WOA→AOA hybrid with SMOTE, multi-seed search, and ensemble."""
         key = "GWO-WOA-AOA-CNN"
         with self._stage(key):
-            self._bind_fitness_data(data)
-            reset_history()
+            X_train, y_train, y_train_raw = self._prepare_hybrid_training_data(
+                data
+            )
             it = self.settings.hybrid_iterations_per_stage
+            seed_results: list[dict] = []
+
+            for seed in self.settings.search_seeds:
+                self.log.info(
+                    "Hybrid seed=%d | pop=%d stages=%d+%d+%d | cv_folds=%d",
+                    seed,
+                    self.settings.population_size,
+                    it,
+                    it,
+                    it,
+                    self.settings.cv_folds,
+                )
+                set_random_seeds(seed)
+                reset_history()
+                reset_search_checkpoints(clear_disk=True)
+                self._configure_fitness_runtime(seed, key)
+                self._bind_fitness_data(
+                    X_train, y_train, data.X_val, data.y_val, y_train_raw
+                )
+
+                hybrid = HybridOptimizer(
+                    population_size=self.settings.population_size,
+                    gwo_iterations=it,
+                    woa_iterations=it,
+                    aoa_iterations=it,
+                    lower_bounds=LOWER_BOUNDS,
+                    upper_bounds=UPPER_BOUNDS,
+                )
+                best_hp, best_fitness, curve = hybrid.optimize(
+                    X_train,
+                    y_train,
+                    data.X_val,
+                    data.y_val,
+                    verbose=True,
+                    y_train_raw=y_train_raw,
+                )
+                self.log.info(
+                    "Seed %d hybrid best fitness=%.4f val_acc=%.2f%%",
+                    seed,
+                    best_fitness,
+                    (1 - best_fitness) * 100,
+                )
+
+                model = hybrid.train_final_model(
+                    X_train,
+                    y_train,
+                    data.X_val,
+                    data.y_val,
+                    verbose=True,
+                    n_attempts=self.settings.train_attempts_final,
+                    patience=self.settings.early_stopping_patience,
+                    base_seed=seed,
+                    reuse_search_best=self.settings.reuse_search_best_model,
+                )
+                _, val_acc = model.evaluate(
+                    data.X_val, data.y_val, verbose=0
+                )
+                seed_results.append(
+                    {
+                        "seed": seed,
+                        "model": model,
+                        "hyperparams": best_hp,
+                        "fitness": best_fitness,
+                        "curve": curve,
+                        "val_accuracy": float(val_acc),
+                        "checkpoints": hybrid.get_ensemble_checkpoints(),
+                    }
+                )
+
+            best_run = max(seed_results, key=lambda r: r["val_accuracy"])
+            model = best_run["model"]
+            best_hp = best_run["hyperparams"]
+            curve = best_run["curve"]
+
             self.log.info(
-                "Hybrid optimisation | pop=%d stages=%d+%d+%d",
-                self.settings.population_size,
-                it,
-                it,
-                it,
+                "Selected seed %d for primary model (val_acc=%.2f%%)",
+                best_run["seed"],
+                best_run["val_accuracy"] * 100,
             )
-            hybrid = HybridOptimizer(
-                population_size=self.settings.population_size,
-                gwo_iterations=it,
-                woa_iterations=it,
-                aoa_iterations=it,
-                lower_bounds=LOWER_BOUNDS,
-                upper_bounds=UPPER_BOUNDS,
-            )
-            best_hp, best_fitness, curve = hybrid.optimize(
-                data.X_train,
-                data.y_train,
-                data.X_val,
-                data.y_val,
-                verbose=True,
-            )
-            self.log.info(
-                "Hybrid best fitness=%.4f val_acc=%.2f%%",
-                best_fitness,
-                (1 - best_fitness) * 100,
-            )
-            model = hybrid.train_final_model(
-                data.X_train,
-                data.y_train,
-                data.X_val,
-                data.y_val,
-                verbose=True,
-                n_attempts=self.settings.train_attempts_final,
-            )
-            self._persist_model(
-                key, model, best_hp, curve, "GWO-WOA-AOA"
-            )
+
+            self._persist_model(key, model, best_hp, curve, "GWO-WOA-AOA")
+
+            ensemble_models: list = []
+            ensemble_meta: list[dict] = []
+            extra_ensemble_models: list = []
+            for run in seed_results:
+                ensemble_models.append(run["model"])
+                ensemble_meta.append(
+                    {
+                        "seed": run["seed"],
+                        "val_accuracy": run["val_accuracy"],
+                        "source": "final_model",
+                    }
+                )
+
+            for run in seed_results:
+                for ckpt in run.get("checkpoints", []):
+                    try:
+                        from src.cnn_model import load_model_from_checkpoint
+
+                        ens_model = load_model_from_checkpoint(
+                            ckpt["hyperparams"],
+                            ckpt["weights_path"],
+                        )
+                        ensemble_models.append(ens_model)
+                        extra_ensemble_models.append(ens_model)
+                        ensemble_meta.append(
+                            {
+                                "seed": run["seed"],
+                                "val_accuracy": ckpt.get("val_accuracy"),
+                                "source": "search_checkpoint",
+                            }
+                        )
+                    except Exception as exc:
+                        self.log.warning(
+                            "Skipping ensemble checkpoint: %s", exc
+                        )
+
+            if len(ensemble_models) > 1:
+                save_ensemble_models(
+                    self.run_dir,
+                    key,
+                    ensemble_models,
+                    metadata=ensemble_meta,
+                )
+                self.log.info(
+                    "Saved ensemble with %d members", len(ensemble_models)
+                )
+
+            for run in seed_results:
+                if run["model"] is not model:
+                    release_model(run["model"], label=f"{key}-seed{run['seed']}")
+            for ens_model in extra_ensemble_models:
+                release_model(ens_model, label=f"{key}-ensemble-extra")
             release_model(model, label=key)
             cleanup_after_stage(key)
         return key
@@ -380,6 +564,36 @@ class PipelineRunner:
                 convergence_curves=convergence_curves or None,
                 hp_dict=hp_dict or None,
             )
+
+            hybrid_key = "GWO-WOA-AOA-CNN"
+            if ensemble_manifest_exists(self.run_dir, hybrid_key):
+                ensemble_models = load_ensemble_models(
+                    self.run_dir, hybrid_key
+                )
+                if len(ensemble_models) > 1:
+                    self.log.info(
+                        "Evaluating %s with ensemble (%d members)",
+                        hybrid_key,
+                        len(ensemble_models),
+                    )
+                    _, _, ens_metrics = evaluate_ensemble(
+                        ensemble_models,
+                        data.X_test,
+                        data.y_test,
+                        data.y_test_raw,
+                    )
+                    single_acc = results.get(hybrid_key, {}).get(
+                        "accuracy", 0
+                    )
+                    ens_acc = ens_metrics.get("accuracy", 0)
+                    results[hybrid_key] = ens_metrics
+                    self.log.info(
+                        "Hybrid single=%.2f%% ensemble=%.2f%% (using ensemble)",
+                        single_acc,
+                        ens_acc,
+                    )
+                    for ens_model in ensemble_models:
+                        release_model(ens_model, label="ensemble-member")
 
             out = self.settings.outputs_dir / "results" / (
                 f"metrics_{self.run_id}.json"

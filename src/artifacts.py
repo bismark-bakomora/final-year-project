@@ -134,6 +134,50 @@ def list_saved_models(run_dir: Path) -> list[str]:
     )
 
 
+def save_ensemble_models(
+    run_dir: Path,
+    model_key: str,
+    models: list,
+    *,
+    metadata: list[dict] | None = None,
+) -> Path:
+    """Save ensemble member models and manifest."""
+    ens_dir = run_dir / model_key / "ensemble"
+    ens_dir.mkdir(parents=True, exist_ok=True)
+    manifest: list[dict] = []
+    for idx, model in enumerate(models):
+        out = ens_dir / f"member_{idx}.keras"
+        model.save(out)
+        entry = {"index": idx, "path": str(out)}
+        if metadata and idx < len(metadata):
+            entry.update(metadata[idx])
+        manifest.append(entry)
+    meta_path = ens_dir / "manifest.json"
+    _write_json(meta_path, manifest)
+    logger.info("Saved ensemble (%d members) -> %s", len(models), ens_dir)
+    return ens_dir
+
+
+def load_ensemble_models(run_dir: Path, model_key: str) -> list:
+    import tensorflow as tf
+
+    ens_dir = run_dir / model_key / "ensemble"
+    meta_path = ens_dir / "manifest.json"
+    if not meta_path.exists():
+        return []
+    manifest = json.loads(meta_path.read_text(encoding="utf-8"))
+    models = []
+    for entry in manifest:
+        path = Path(entry["path"])
+        if path.exists():
+            models.append(tf.keras.models.load_model(path))
+    return models
+
+
+def ensemble_manifest_exists(run_dir: Path, model_key: str) -> bool:
+    return (run_dir / model_key / "ensemble" / "manifest.json").exists()
+
+
 def register_artifact(run_dir: Path, model_key: str) -> None:
     path = run_dir / MANIFEST_FILE
     data = json.loads(path.read_text(encoding="utf-8"))

@@ -113,6 +113,23 @@ def evaluate_model(model, X_test, y_test_cat,
     return y_pred, y_prob_pos, metrics
 
 
+def ensemble_predict_proba(models: list, X) -> np.ndarray:
+    """Average softmax probabilities across ensemble members."""
+    if not models:
+        raise ValueError("ensemble_predict_proba requires at least one model")
+    probs = [m.predict(X, verbose=0) for m in models]
+    return np.mean(probs, axis=0)
+
+
+def evaluate_ensemble(models: list, X_test, y_test_cat, y_test_raw):
+    """Evaluate an ensemble via averaged class probabilities."""
+    y_prob = ensemble_predict_proba(models, X_test)
+    y_pred = np.argmax(y_prob, axis=1)
+    y_prob_pos = y_prob[:, 1]
+    metrics = compute_metrics(y_test_raw, y_pred, y_prob_pos)
+    return y_pred, y_prob_pos, metrics
+
+
 # ─────────────────────────────────────────
 # PLOT CONFUSION MATRIX — Figure 9
 # Paper: 6 confusion matrices side by side
